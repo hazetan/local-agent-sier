@@ -5,6 +5,7 @@ from core.config import (
     get_max_ctx_chars_budget,
     get_max_steps_per_phase,
     get_sandbox_env_hint,
+    get_server_ctx_size,
 )
 from core.llm_client import chat_step, generate_heavy_brain
 from core.logger import RoleLogger, system_logger
@@ -25,12 +26,21 @@ from .roles import (
 )
 
 
-def build_fresh_workspace_snapshot() -> str:
-    """毎回最新の社内標準ドキュメント4点を読み込んでプロンプトに注入する"""
-    readme = read_workspace_doc("~/README.md")
-    task = read_workspace_doc("~/TASK.md")
-    design = read_workspace_doc("~/DESIGN.md")
-    report = read_workspace_doc("~/REPORT.md")
+def build_fresh_workspace_snapshot(max_chars_per_doc: int = 25000) -> str:
+    """毎回最新の社内標準ドキュメント4点を読み込んでプロンプトに注入する（肥大化防止上限付き）"""
+    def _read_capped(doc_path: str) -> str:
+        text = read_workspace_doc(doc_path)
+        if len(text) > max_chars_per_doc:
+            return (
+                text[:max_chars_per_doc]
+                + f"\n...(truncated at {max_chars_per_doc:,} chars in snapshot; use read_file('{doc_path}') if full text is needed)..."
+            )
+        return text
+
+    readme = _read_capped("~/README.md")
+    task = _read_capped("~/TASK.md")
+    design = _read_capped("~/DESIGN.md")
+    report = _read_capped("~/REPORT.md")
 
     return (
         "=== 現在の社内標準ドキュメント (Single Source of Truth) ===\n"
@@ -44,27 +54,36 @@ def build_fresh_workspace_snapshot() -> str:
 
 def _enforce_context_budget(messages: list[dict[str, Any]], budget_chars: int) -> None:
     """
-    累積メッセージ長が256kコンテキスト予算を超えないよう、
-    実際にOllamaへ送信される _clean_content ベースで計算し、古い tool 出力から圧縮する。
+    SERVER_CTX_SIZE に連動した実効文字数上限を強制する。
+    1. 古い tool 出力の圧縮
+    2. それでも超過する場合は先頭3件 (System, Snapshot, 初期User指示) を絶対保護したまま古い中間履歴を削除
     """
+    srv_ctx = get_server_ctx_size() or 65536
+    effective_budget = min(budget_chars, int(srv_ctx * 2.0))
+
     def _total_chars() -> int:
         return sum(len(str(m.get("_clean_content", m.get("content") or ""))) for m in messages)
 
-    if _total_chars() <= budget_chars:
+    if _total_chars() <= effective_budget:
         return
 
-    # 直近2件のメッセージは保護し、古い tool メッセージから圧縮する
-    for msg in messages[:-2]:
-        if _total_chars() <= budget_chars:
+    # Step 1: 直近4件を除き、古い tool メッセージから圧縮する
+    for msg in messages[:-4]:
+        if _total_chars() <= effective_budget:
             break
         if msg.get("role") == "tool":
             content = str(msg.get("content") or "")
-            if len(content) > 4000:
+            if len(content) > 2000:
                 msg["content"] = (
-                    content[:2000]
-                    + f"\n...(older tool output compressed to preserve 256k context budget; {len(content)} chars)...\n"
-                    + content[-1500:]
+                    content[:1000]
+                    + f"\n...(compressed from {len(content)} chars to fit context window)...\n"
+                    + content[-800:]
                 )
+                msg["_clean_content"] = msg["content"]
+
+    # Step 2: まだ上限を超える場合、先頭3件と末尾6件を保護しつつ古い中間ターンを削除する
+    while _total_chars() > effective_budget and len(messages) > 9:
+        del messages[3]
 
 
 
@@ -77,12 +96,13 @@ async def run_role_phase(
     telemetry.start_role(role)
 
     steps_limit = max_steps or get_max_steps_per_phase()
-    ctx_char_budget = get_max_ctx_chars_budget()
-    max_tool_output_chars = int(ctx_char_budget * 0.7)
+    srv_ctx = get_server_ctx_size() or 65536
+    ctx_char_budget = min(get_max_ctx_chars_budget(is_heavy=False), int(srv_ctx * 2.0))
+    max_tool_output_chars = int(ctx_char_budget * 0.5)
     logger = RoleLogger(role)
     tools = get_tools_for_role(ROLE_ALLOWED_TOOLS[role])
 
-    system_logger.log("RUNNER", f"▶ Start role={role} | max_steps={steps_limit} | ctx_char_budget={ctx_char_budget:,}")
+    system_logger.log("RUNNER", f"▶ Start role={role} | max_steps={steps_limit} | effective_char_budget={ctx_char_budget:,}")
 
     system_prompt = ROLE_PROMPTS[role]
     if role in ("SE", "PG", "QA"):
@@ -99,6 +119,7 @@ async def run_role_phase(
     created_zips: list[str] = []
     final_summary = ""
     header_logged = False
+    no_tool_streak = 0
 
     try:
         for step in range(1, steps_limit + 1):
@@ -124,17 +145,42 @@ async def run_role_phase(
             )
 
             if not tool_calls:
+                no_tool_streak += 1
                 logger.log_step(step, thought, latency_sec=latency, tps=tps)
                 telemetry.record_raw_step(role, model_name, step, steps_limit, latency, thought, tps=tps)
                 if telemetry.on_raw_update:
                     await telemetry.on_raw_update()
 
-                messages.append({
-                    "role": "user",
-                    "content": "ツールを直接呼び出して作業を進めるか、`complete_phase` を呼び出して完了してください。",
-                })
+                if no_tool_streak >= 4:
+                    system_logger.log("RUNNER", f"[{role}] Aborting phase: tool_calls=0 for {no_tool_streak} consecutive steps.", level="WARN")
+                    break
+
+                if no_tool_streak >= 2:
+                    system_logger.log("RUNNER", f"[{role}] Resetting middle history after {no_tool_streak} empty tool steps.", level="WARN")
+                    messages[1] = {"role": "system", "content": build_fresh_workspace_snapshot()}
+                    del messages[3:]
+                    role_hint = (
+                        "今すぐ `invoke_heavy_brain` を呼び出して重量モデル (Qwen3-Coder-Next) に設計・実装を行わせるか、"
+                        "既に完了していれば `edit_lines` で `~/TASK.md` を更新して `complete_phase` を呼び出してください。"
+                        if role in ("SE", "PG")
+                        else "今すぐ適切なツールを呼び出すか、`complete_phase` を呼び出してフェーズを完了してください。"
+                    )
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"【警告：ツール呼び出しが{no_tool_streak}回連続で検出されませんでした】\n"
+                            "通常のテキスト回答は不要です。必ず Function Calling（または JSON ツール形式）で"
+                            f"{role_hint}"
+                        ),
+                    })
+                else:
+                    messages.append({
+                        "role": "user",
+                        "content": "ツールを直接呼び出して作業を進めるか、`complete_phase` を呼び出して完了してください。",
+                    })
                 continue
 
+            no_tool_streak = 0
             phase_done = False
             for call in tool_calls:
                 fn_name = call["function"]["name"]
@@ -162,7 +208,7 @@ async def run_role_phase(
                 if len(output) > max_tool_output_chars:
                     trimmed_out = (
                         output[:max_tool_output_chars]
-                        + f"\n...(truncated at {max_tool_output_chars:,} chars to fit within 256k context budget)..."
+                        + f"\n...(truncated at {max_tool_output_chars:,} chars to fit within context budget)..."
                     )
                 else:
                     trimmed_out = output
@@ -242,7 +288,7 @@ async def _execute_heavy_brain_stage(
     thinking_text, clean_md, h_latency, h_model, h_tps = await generate_heavy_brain(
         role, heavy_sys_prompt, heavy_user_prompt
     )
-    applied_files = await asyncio.to_thread(auto_apply_heavy_markdown, clean_md)
+    applied_files = await asyncio.to_thread(auto_apply_heavy_markdown, clean_md, raw_targets)
 
     summary_header = (
         f"[Heavy Brain ({h_model}) Execution Completed in {h_latency:.1f}s ({h_tps:.2f} tok/s)]\n"

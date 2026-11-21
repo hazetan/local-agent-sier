@@ -108,11 +108,12 @@ def extract_fallback_tool_calls(content: str) -> list[dict[str, Any]]:
     )
     candidates.extend(tag_matches)
 
-    md_matches = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", content, flags=re.DOTALL)
+    md_matches = re.findall(r"```(?:json|tool_call|python)?\s*(\{.*?\}|\[.*?\])\s*```", content, flags=re.DOTALL)
     candidates.extend(md_matches)
 
-    if not candidates and content.strip().startswith("{") and content.strip().endswith("}"):
-        candidates.append(content.strip())
+    stripped = content.strip()
+    if not candidates and ((stripped.startswith("{") and stripped.endswith("}")) or (stripped.startswith("[") and stripped.endswith("]"))):
+        candidates.append(stripped)
 
     calls: list[dict[str, Any]] = []
     for idx, cand in enumerate(candidates, 1):
@@ -121,15 +122,22 @@ def extract_fallback_tool_calls(content: str) -> list[dict[str, Any]]:
             continue
         items = parsed if isinstance(parsed, list) else [parsed]
         for item in items:
-            if isinstance(item, dict) and "name" in item:
-                args = item.get("arguments", item.get("args", {}))
-                if isinstance(args, str):
-                    args = _parse_json_lenient(args) or {}
-                calls.append({
-                    "id": f"fallback_call_{idx}",
-                    "type": "function",
-                    "function": {"name": item["name"], "arguments": args},
-                })
+            if not isinstance(item, dict):
+                continue
+            fn_obj = item.get("function") if isinstance(item.get("function"), dict) else item
+            fn_name = fn_obj.get("name") or fn_obj.get("tool") or fn_obj.get("tool_name")
+            if not fn_name or not isinstance(fn_name, str):
+                continue
+            args = fn_obj.get("arguments", fn_obj.get("args", fn_obj.get("parameters", {})))
+            if isinstance(args, str):
+                args = _parse_json_lenient(args) or {}
+            elif not isinstance(args, dict):
+                args = {}
+            calls.append({
+                "id": f"fallback_call_{idx}",
+                "type": "function",
+                "function": {"name": fn_name, "arguments": args},
+            })
     return calls
 
 
@@ -440,9 +448,11 @@ async def warmup_models() -> None:
 
 async def _unload_models_for_heavy(heavy_model_name: str) -> None:
     """
-    70B等の重量モデルをロードする前に、VRAM/RAM上に常駐している別名の通常モデルを
-    keep_alive=0 でアンロードし、16GB VRAM + 64GB RAM をすべて重量モデルへ明け渡す。
+    Qwen3-Coder-Next 等の重量モデルを128k CTXでロードする前に、
+    Ollama /api/ps 上で稼働中の別モデルおよび設定上の軽量モデルをすべて keep_alive=0 でアンロードする。
     """
+    from .config import get_ollama_ps_url
+
     models_to_unload: list[str] = []
     for r in ("PM", "SE", "PG", "QA", "AUDITOR"):
         try:
@@ -452,22 +462,35 @@ async def _unload_models_for_heavy(heavy_model_name: str) -> None:
         except Exception:
             continue
 
-    if not models_to_unload:
-        return
-
     chat_url = get_ollama_chat_url()
+    ps_url = get_ollama_ps_url()
     timeout = aiohttp.ClientTimeout(total=30)
+
     async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            async with session.get(ps_url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    for m_info in data.get("models", []):
+                        loaded_name = m_info.get("name")
+                        if loaded_name and loaded_name != heavy_model_name and loaded_name not in models_to_unload:
+                            models_to_unload.append(loaded_name)
+        except Exception:
+            pass
+
         for m in models_to_unload:
             try:
-                system_logger.log("LLM_CLIENT", f"[HEAVY_PREP] Unloading light model '{m}' to free VRAM/RAM for '{heavy_model_name}'...")
+                system_logger.log("LLM_CLIENT", f"[HEAVY_PREP] Unloading '{m}' to free 16GB VRAM + 64GB RAM for '{heavy_model_name}'...")
                 async with session.post(
                     chat_url,
                     json={"model": m, "messages": [], "stream": False, "keep_alive": 0},
                 ) as resp:
                     await resp.read()
             except Exception as exc:
-                system_logger.log("LLM_CLIENT", f"[HEAVY_PREP] Unload request warning for '{m}': {exc}", level="WARN")
+                system_logger.log("LLM_CLIENT", f"[HEAVY_PREP] Unload warning for '{m}': {exc}", level="WARN")
+
+
+_heavy_lock = asyncio.Lock()
 
 
 async def generate_heavy_brain(
@@ -476,9 +499,10 @@ async def generate_heavy_brain(
     user_prompt: str,
 ) -> tuple[str, str, float, str, float]:
     """
-    Stage 2 (Pure Brain): 重量モデル (MODEL_HEAVY) をツール無しで1回だけ呼び出し、
+    Stage 2 (Pure Brain): 重量モデル (Qwen3-Coder-Next) をツール無しで1回だけ呼び出し、
     (thinking_text, clean_markdown, latency_sec, model_name, tps) を返す。
-    実行中は全並列枠をロックして通常モデルをVRAMから退避させ、完了後は即解放する。
+    実行中は全並列枠 (PM用枠含むすべて) を完全ロックして他モデルの同時ロードによるOOMを防ぎ、
+    完了後は重量モデルを即座にアンロードしてロックを解放する。
     """
     model_name = get_heavy_model_for_role(role)
     light_model_name = get_model_for_role(role)
@@ -506,7 +530,6 @@ async def generate_heavy_brain(
     if keep_alive is not None:
         payload["keep_alive"] = keep_alive
     elif model_name != light_model_name:
-        # 通常モデルと別モデル(70B等)の場合はデフォルトで推論直後にメモリを即解放する
         payload["keep_alive"] = 0
 
     est_chars = len(json.dumps(prepared_msgs, ensure_ascii=False))
@@ -515,16 +538,39 @@ async def generate_heavy_brain(
 
     start_t = time.perf_counter()
     total_sem, bg_sem = _get_llm_semaphores()
+    total_slots = max(1, _configured_parallel)
+    bg_slots = max(1, _configured_parallel - 1)
 
     telemetry.set_heavy_mode(role, True)
     try:
-        async with bg_sem:
-            async with total_sem:
-                system_logger.log("LLM_CLIENT", f"[{role}:HEAVY] Exclusive lock acquired. Preparing VRAM for {model_name}...")
-                await _unload_models_for_heavy(model_name)
-                msg, prompt_tok, eval_tok, eval_duration_ns, elapsed_req = await _execute_ollama_stream(
-                    role, model_name, payload, est_input_tok
+        async with _heavy_lock:
+            acquired_bg = 0
+            acquired_total = 0
+            try:
+                for _ in range(bg_slots):
+                    await bg_sem.acquire()
+                    acquired_bg += 1
+                for _ in range(total_slots):
+                    await total_sem.acquire()
+                    acquired_total += 1
+
+                system_logger.log(
+                    "LLM_CLIENT",
+                    f"[{role}:HEAVY] All {total_slots} parallel slots locked exclusively. Preparing VRAM/RAM for {model_name}...",
                 )
+                await _unload_models_for_heavy(model_name)
+                try:
+                    msg, prompt_tok, eval_tok, eval_duration_ns, elapsed_req = await _execute_ollama_stream(
+                        role, model_name, payload, est_input_tok
+                    )
+                finally:
+                    if model_name != light_model_name:
+                        await _unload_models_for_heavy(light_model_name)
+            finally:
+                for _ in range(acquired_total):
+                    total_sem.release()
+                for _ in range(acquired_bg):
+                    bg_sem.release()
     finally:
         telemetry.set_heavy_mode(role, False)
 

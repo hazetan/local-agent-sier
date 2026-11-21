@@ -3,17 +3,25 @@ import hashlib
 
 from core.config import get_auditor_interval_sec
 from core.logger import read_recent_logs, system_logger
+from core.telemetry import telemetry
 
 from .runner import run_role_phase
 
 
 async def continuous_auditor_loop() -> None:
-    """定期的に各部署のログ変化を検知し、変化時のみ ~/REPORT.md を更新する常駐ループ"""
+    """定期的に各部署のログ変化を検知し、他部署がアイドル時かつ変化時のみ ~/REPORT.md を更新する常駐ループ"""
     last_digest = ""
     system_logger.log("AUDITOR", "continuous_auditor_loop started.")
     while True:
         await asyncio.sleep(get_auditor_interval_sec())
         try:
+            if telemetry.active_roles:
+                system_logger.log(
+                    "AUDITOR",
+                    f"Skipped audit: Other role(s) currently active ({telemetry.active_role_label}).",
+                )
+                continue
+
             recent_logs = read_recent_logs(["PM", "SE", "PG", "QA"])
             if "(No logs recorded yet)" in recent_logs:
                 system_logger.log("AUDITOR", "Skipped audit: No logs recorded yet.")

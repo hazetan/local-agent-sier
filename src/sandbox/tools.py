@@ -560,14 +560,18 @@ def build_heavy_context_bundle(context_paths: list[str]) -> str:
     """
     Stage 2 用に、指定されたファイル・ディレクトリ群をPythonで高速に一括読み込みし、
     行番号なしのクリーンなテキストバンドルとして結合する。
+    （Snapshotと重複するルート直下の標準4ドキュメントは自動スキップする）
     """
     ws = get_workspace_dir().resolve()
+    standard_root_docs = {(ws / name).resolve() for name in INITIAL_DOCUMENTS}
     char_budget = int(get_max_ctx_chars_budget(is_heavy=True) * 0.65)
     collected: list[Path] = []
     seen: set[Path] = set()
 
     def _add(p: Path) -> None:
         r = p.resolve()
+        if r in standard_root_docs:
+            return
         if r not in seen and _is_readable_text_file(r):
             seen.add(r)
             collected.append(r)
@@ -606,41 +610,56 @@ HEAVY_FILE_HEADER_PATTERN = re.compile(
 )
 
 
-def auto_apply_heavy_markdown(markdown_text: str) -> list[str]:
+def auto_apply_heavy_markdown(
+    markdown_text: str,
+    default_targets: list[str] | None = None,
+) -> list[str]:
     """
     Stage 3 (Auto-Apply): 重量モデルが出力した Markdown から
-    '### FILE: ~/path/to/file' セクションを分割し、内部にネストしたコードブロックが
-    あっても途切れないようセクション内の最初と最後の ``` の間を抽出して自動保存する。
+    '### FILE: ~/path/to/file' セクションを分割して自動保存する。
+    - セクション冒頭が ``` で始まる場合は最初の ``` と最後の ``` の間を抽出。
+    - 冒頭が ``` で始まらない場合（Markdown設計書等）は内部のコード例で途切れないようセクション全文を保存。
+    - '### FILE:' が省略された場合でも target_files が1件のみならそのファイルへフォールバック保存。
     """
     ws = get_workspace_dir().resolve()
     applied_reports: list[str] = []
 
-    matches = list(HEAVY_FILE_HEADER_PATTERN.finditer(markdown_text))
-    for idx, match in enumerate(matches):
-        raw_path = match.group(1).strip().strip("`'\"* ")
-        section_start = match.end()
-        section_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(markdown_text)
-        section = markdown_text[section_start:section_end]
+    def _extract_body(section_text: str) -> str:
+        stripped = section_text.strip()
+        first_fence = re.match(r"^```[^\n]*\n", stripped)
+        if first_fence:
+            content_start = first_fence.end()
+            last_fence_pos = stripped.rfind("```")
+            if last_fence_pos > first_fence.start():
+                return stripped[content_start:last_fence_pos]
+            return stripped[content_start:]
+        return stripped + "\n"
 
-        first_fence = re.search(r"```[^\n]*\n", section)
-        if not first_fence:
-            continue
-        content_start = first_fence.end()
-        last_fence_pos = section.rfind("```")
-        if last_fence_pos <= first_fence.start():
-            code_body = section[content_start:]
-        else:
-            code_body = section[content_start:last_fence_pos]
-
+    def _save_to_path(raw_path: str, body: str) -> None:
         target = resolve_workspace_path(raw_path)
         if not target or target.is_dir():
             applied_reports.append(f"[ERROR] Invalid target path skipped: {raw_path}")
-            continue
-
+            return
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(code_body, encoding="utf-8")
+        target.write_text(body, encoding="utf-8")
         rel = target.relative_to(ws)
-        line_cnt = len(code_body.splitlines())
-        applied_reports.append(f"~/{rel} ({line_cnt} lines, {len(code_body)} chars)")
+        line_cnt = len(body.splitlines())
+        applied_reports.append(f"~/{rel} ({line_cnt} lines, {len(body)} chars)")
+
+    matches = list(HEAVY_FILE_HEADER_PATTERN.finditer(markdown_text))
+    if matches:
+        for idx, match in enumerate(matches):
+            raw_path = match.group(1).strip().strip("`'\"* ")
+            section_start = match.end()
+            section_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(markdown_text)
+            section = markdown_text[section_start:section_end]
+            code_body = _extract_body(section)
+            if code_body.strip():
+                _save_to_path(raw_path, code_body)
+    elif default_targets and len(default_targets) == 1 and markdown_text.strip():
+        raw_path = str(default_targets[0]).strip().strip("`'\"* ")
+        code_body = _extract_body(markdown_text)
+        if code_body.strip():
+            _save_to_path(raw_path, code_body)
 
     return applied_reports

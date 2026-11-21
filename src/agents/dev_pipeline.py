@@ -95,7 +95,7 @@ async def _execute_autonomous_initiative(on_phase_complete: StatusCallback | Non
 
 async def continuous_dev_pipeline_loop(on_phase_complete: StatusCallback | None = None) -> None:
     """
-    未処理タスクが存在する役職 (QA, PG, SE) を各役職最大1人ずつ同時に並列実行し、
+    未処理タスクが存在する役職を優先順 (QA -> PG -> SE) に1部署ずつ直列実行し（モデル奪い合い・ファイル競合防止）、
     全タスク完了後のアイドル状態が一定時間続いた場合は自律行動（整理整頓・自己起票）を発動するループ
     """
     running_tasks: dict[str, asyncio.Task[None]] = {}
@@ -128,13 +128,14 @@ async def continuous_dev_pipeline_loop(on_phase_complete: StatusCallback | None 
                     system_logger.log("DEV_PIPELINE", f"Detected pending roles in ~/TASK.md: {pending_roles}")
                     last_pending = list(pending_roles)
 
-                for role in pending_roles:
-                    if role not in running_tasks:
-                        system_logger.log("DEV_PIPELINE", f"Spawning async worker task for role={role}")
-                        running_tasks[role] = asyncio.create_task(
-                            _execute_single_role(role, on_phase_complete),
-                            name=f"worker_{role}",
-                        )
+                # 品質とVRAM/RAM効率を最優先するため、開発ラインは最優先の1部署のみを排他実行する
+                if not running_tasks and pending_roles:
+                    next_role = pending_roles[0]
+                    system_logger.log("DEV_PIPELINE", f"Spawning exclusive worker task for role={next_role}")
+                    running_tasks[next_role] = asyncio.create_task(
+                        _execute_single_role(next_role, on_phase_complete),
+                        name=f"worker_{next_role}",
+                    )
 
                 if not running_tasks:
                     if (
