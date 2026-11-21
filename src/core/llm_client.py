@@ -95,50 +95,48 @@ def _parse_json_lenient(raw: str) -> Any | None:
     return None
 
 
-def extract_fallback_tool_calls(content: str) -> list[dict[str, Any]]:
-    """テキスト内に直接出力されたJSONやタグ形式のツール呼び出しを抽出する"""
-    if not content:
-        return []
+def extract_thinking_and_clean(raw_content: str, explicit_thinking: str = "") -> tuple[str, str]:
+    """
+    レスポンスから (思考テキスト, クリーンな本文) を分離・抽出する。
+    <think>, <thought>, <|channel>thought...<channel|>、文字化けした £thought および未クローズ状態に対応。
+    """
+    think_parts: list[str] = []
+    if explicit_thinking and explicit_thinking.strip():
+        think_parts.append(explicit_thinking.strip())
 
-    candidates: list[str] = []
-    tag_matches = re.findall(
-        r"(?:<tool_call>|<\|tool_call_start\|>)\s*(.*?)\s*(?:</tool_call>|<\|tool_call_end\|>)",
-        content,
-        flags=re.DOTALL,
-    )
-    candidates.extend(tag_matches)
+    cleaned = raw_content or ""
+    if cleaned:
+        # Gemma4の文字化け思考タグ (Ï/£thought) を正規化
+        cleaned = re.sub(r"[£Ï]thought\b", "<|channel>thought", cleaned)
 
-    md_matches = re.findall(r"```(?:json|tool_call|python)?\s*(\{.*?\}|\[.*?\])\s*```", content, flags=re.DOTALL)
-    candidates.extend(md_matches)
+        tag_patterns = [
+            (r"<think>(.*?)</think>", "<think>", "</think>"),
+            (r"<thought>(.*?)</thought>", "<thought>", "</thought>"),
+            (r"<\|channel>thought\s*(.*?)<channel\|>", "<|channel>thought", "<channel|>"),
+        ]
+        for regex, open_tag, close_tag in tag_patterns:
+            matches = re.findall(regex, cleaned, flags=re.DOTALL)
+            for m in matches:
+                m_clean = m.strip()
+                if m_clean and m_clean not in think_parts[-1:]:
+                    think_parts.append(m_clean)
+            cleaned = re.sub(regex, "", cleaned, flags=re.DOTALL)
 
-    stripped = content.strip()
-    if not candidates and ((stripped.startswith("{") and stripped.endswith("}")) or (stripped.startswith("[") and stripped.endswith("]"))):
-        candidates.append(stripped)
+            if open_tag in cleaned and close_tag not in cleaned:
+                prefix, unclosed_think = cleaned.split(open_tag, 1)
+                if unclosed_think.strip():
+                    think_parts.append(unclosed_think.strip())
+                cleaned = prefix
 
-    calls: list[dict[str, Any]] = []
-    for idx, cand in enumerate(candidates, 1):
-        parsed = _parse_json_lenient(cand)
-        if not parsed:
-            continue
-        items = parsed if isinstance(parsed, list) else [parsed]
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            fn_obj = item.get("function") if isinstance(item.get("function"), dict) else item
-            fn_name = fn_obj.get("name") or fn_obj.get("tool") or fn_obj.get("tool_name")
-            if not fn_name or not isinstance(fn_name, str):
-                continue
-            args = fn_obj.get("arguments", fn_obj.get("args", fn_obj.get("parameters", {})))
-            if isinstance(args, str):
-                args = _parse_json_lenient(args) or {}
-            elif not isinstance(args, dict):
-                args = {}
-            calls.append({
-                "id": f"fallback_call_{idx}",
-                "type": "function",
-                "function": {"name": fn_name, "arguments": args},
-            })
-    return calls
+        # 残存した特殊制御トークンを除去
+        cleaned = re.sub(
+            r"(?:<\|channel>thought|<channel\|>|<\|?tool_call\|?>|<\|?tool_response\|?>)",
+            "",
+            cleaned,
+        ).strip()
+
+    combined_think = "\n".join(think_parts).strip()
+    return combined_think, cleaned
 
 
 HIGH_THINKING_DIRECTIVE = (
@@ -182,6 +180,25 @@ def _prepare_messages_for_ollama(messages: list[dict[str, Any]]) -> list[dict[st
 
         prepared.append(msg_copy)
     return prepared
+
+
+def _has_repetition_loop(text: str) -> bool:
+    """
+    ストリーミング中の末尾テキストを監視し、Gemma4の思考タグ暴走 (£thought / <channel|> / End of Thought)
+    または同一フレーズの5回以上の異常反復を検知する。
+    """
+    if len(text) < 80:
+        return False
+    tail = text[-800:]
+    for marker in ("£thought", "<channel|>", "<|channel>thought", "(End of Thought)"):
+        if tail.count(marker) >= 5:
+            return True
+    for pat_len in (16, 28, 48, 80):
+        if len(tail) >= pat_len * 5:
+            unit = tail[-pat_len:]
+            if unit.strip() and tail.count(unit) >= 5:
+                return True
+    return False
 
 
 async def _execute_ollama_stream(
@@ -263,6 +280,19 @@ async def _execute_ollama_stream(
                     if chunk_count == 1:
                         first_tok_sec = time.perf_counter() - req_start_t
                         system_logger.log("LLM_CLIENT", f"[{role_label}] First token chunk arrived in {first_tok_sec:.2f}s.")
+
+                    if chunk_count % 8 == 0:
+                        tail_c = "".join(acc_content[-60:])
+                        tail_t = "".join(acc_thinking[-60:])
+                        if _has_repetition_loop(tail_c) or _has_repetition_loop(tail_t):
+                            system_logger.log(
+                                "LLM_CLIENT",
+                                f"[{role_label}] Repetition loop detected at chunk={chunk_count}. Aborting stream early!",
+                                level="WARN",
+                            )
+                            eval_tok = chunk_count
+                            break
+
                     if chunk_count % granularity == 0:
                         elapsed = max(0.001, time.perf_counter() - req_start_t)
                         live_tps = chunk_count / elapsed
@@ -377,17 +407,17 @@ async def chat_step(
 
     thinking_text, clean_content = extract_thinking_and_clean(raw_content, explicit_thinking)
 
-    if not msg.get("tool_calls") and clean_content:
-        fb_calls = extract_fallback_tool_calls(clean_content)
+    if not msg.get("tool_calls"):
+        fb_calls = extract_fallback_tool_calls(clean_content) or extract_fallback_tool_calls(raw_content)
         if fb_calls:
             system_logger.log("LLM_CLIENT", f"[{role}] Extracted {len(fb_calls)} fallback tool call(s) from text.")
             msg["tool_calls"] = fb_calls
 
     msg["_clean_content"] = clean_content
     if thinking_text and clean_content:
-        msg["content"] = f"[Thinking]\n{thinking_text}\n\n[Response]\n{clean_content}"
+        msg["content"] = f"[Thinking]\n{thinking_text[:4000]}\n\n[Response]\n{clean_content}"
     elif thinking_text:
-        msg["content"] = thinking_text
+        msg["content"] = thinking_text[:4000]
     else:
         msg["content"] = clean_content
 
@@ -591,3 +621,129 @@ async def generate_heavy_brain(
     thinking_text, clean_content = extract_thinking_and_clean(raw_content, explicit_thinking)
     latency = time.perf_counter() - start_t
     return thinking_text, clean_content, latency, model_name, tps
+
+
+def _quote_unquoted_keys(s: str) -> str:
+    """Gemma4固有の {directory:"~/...", extensions:[...]} のようなクォート無しキーを標準JSONへ補正する"""
+    pattern = re.compile(
+        r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')|([\{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)(\s*:)'
+    )
+
+    def _repl(m: re.Match) -> str:
+        if m.group(1) is not None:
+            return m.group(1)
+        return f'{m.group(2)}"{m.group(3)}"{m.group(4)}'
+
+    return pattern.sub(_repl, s)
+
+
+def _parse_json_lenient(raw: str) -> Any | None:
+    s = raw.strip()
+    quoted = _quote_unquoted_keys(s)
+    for candidate in (
+        s,
+        re.sub(r",\s*([}\]])", r"\1", s),
+        quoted,
+        re.sub(r",\s*([}\]])", r"\1", quoted),
+    ):
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+    try:
+        val = ast.literal_eval(s)
+        if isinstance(val, (dict, list)):
+            return val
+    except Exception:
+        pass
+    return None
+
+
+def extract_fallback_tool_calls(content: str) -> list[dict[str, Any]]:
+    """テキスト内に直接出力されたGemma4独自形式 (call:fn{...}) やJSON/タグ形式のツール呼び出しを抽出する"""
+    if not content:
+        return []
+
+    calls: list[dict[str, Any]] = []
+
+    # 1. Gemma4 ネイティブ構文: call:tool_name{key:"value", ...}
+    for m in re.finditer(r"call:([a-zA-Z0-9_]+)\s*\{", content):
+        fn_name = m.group(1)
+        brace_start = m.end() - 1
+        depth = 0
+        in_str = False
+        esc = False
+        quote_ch = ""
+        end_pos = -1
+        for i in range(brace_start, len(content)):
+            ch = content[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == quote_ch:
+                    in_str = False
+            else:
+                if ch in ('"', "'"):
+                    in_str = True
+                    quote_ch = ch
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end_pos = i + 1
+                        break
+        raw_obj = content[brace_start:end_pos] if end_pos != -1 else content[brace_start:]
+        parsed_args = _parse_json_lenient(raw_obj)
+        if not isinstance(parsed_args, dict):
+            parsed_args = {}
+        calls.append({
+            "id": f"gemma_call_{len(calls) + 1}",
+            "type": "function",
+            "function": {"name": fn_name, "arguments": parsed_args},
+        })
+
+    if calls:
+        return calls
+
+    # 2. <tool_call> タグおよび ```json コードブロック形式
+    candidates: list[str] = []
+    tag_matches = re.findall(
+        r"(?:<tool_call>|<\|tool_call_start\|>)\s*(.*?)\s*(?:</tool_call>|<\|tool_call_end\|>)",
+        content,
+        flags=re.DOTALL,
+    )
+    candidates.extend(tag_matches)
+
+    md_matches = re.findall(r"```(?:json|tool_call|python)?\s*(\{.*?\}|\[.*?\])\s*```", content, flags=re.DOTALL)
+    candidates.extend(md_matches)
+
+    stripped = content.strip()
+    if not candidates and ((stripped.startswith("{") and stripped.endswith("}")) or (stripped.startswith("[") and stripped.endswith("]"))):
+        candidates.append(stripped)
+
+    for idx, cand in enumerate(candidates, 1):
+        parsed = _parse_json_lenient(cand)
+        if not parsed:
+            continue
+        items = parsed if isinstance(parsed, list) else [parsed]
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            fn_obj = item.get("function") if isinstance(item.get("function"), dict) else item
+            fn_name = fn_obj.get("name") or fn_obj.get("tool") or fn_obj.get("tool_name")
+            if not fn_name or not isinstance(fn_name, str):
+                continue
+            args = fn_obj.get("arguments", fn_obj.get("args", fn_obj.get("parameters", {})))
+            if isinstance(args, str):
+                args = _parse_json_lenient(args) or {}
+            elif not isinstance(args, dict):
+                args = {}
+            calls.append({
+                "id": f"fallback_call_{idx}",
+                "type": "function",
+                "function": {"name": fn_name, "arguments": args},
+            })
+    return calls
