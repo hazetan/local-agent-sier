@@ -232,9 +232,17 @@ def _visual_width(text: str) -> int:
 
 
 
+def _sanitize_for_ansi_box(text: str) -> str:
+    """Discordの```ansiブロックを破壊する3連バッククォートや制御コードを無害化する"""
+    sanitized = text.replace("\x1b", "")
+    while "```" in sanitized:
+        sanitized = sanitized.replace("```", "'''")
+    return sanitized
+
+
 def _truncate_line(text: str, max_width: int = LINE_MAX_CHARS) -> str:
     """改行を除き、見た目上の横幅（全角2/半角1）で末尾を省略する"""
-    clean = text.replace("\n", " ").replace("\r", "")
+    clean = _sanitize_for_ansi_box(text).replace("\n", " ").replace("\r", "")
     if _visual_width(clean) <= max_width:
         return clean
     out: list[str] = []
@@ -427,8 +435,9 @@ async def render_status_box() -> str:
 
 def _format_fixed_block(text: str, fixed_lines: int, max_width: int = 68) -> list[str]:
     """見た目上の横幅（全角2/半角1）で折り返し、必ず fixed_lines 行のリストに整形する"""
+    safe_text = _sanitize_for_ansi_box(text)
     wrapped: list[str] = []
-    for raw_line in text.splitlines() or [""]:
+    for raw_line in safe_text.splitlines() or [""]:
         line = raw_line.strip("\r")
         if not line:
             wrapped.append("  ")
@@ -455,7 +464,6 @@ def _format_fixed_block(text: str, fixed_lines: int, max_width: int = 68) -> lis
         wrapped.append(" ")
 
     return wrapped
-
 
 def render_raw_log_box() -> str:
     """log-raw チャンネル向けに横幅・上下行数・2000文字上限を厳守した生ログBoxを生成する"""

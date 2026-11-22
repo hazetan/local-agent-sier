@@ -347,3 +347,7 @@ def get_io_chunk_bytes() -> int:
 
 def get_max_ctx_chars_budget(is_heavy: bool = False) -> int:
     return require_env_int("CTX_CHAR_BUDGET_HEAVY" if is_heavy else "CTX_CHAR_BUDGET_LIGHT")
+
+
+def get_reset_workspace_on_startup() -> bool:
+    return bool(get_env_bool("RESET_WORKSPACE_ON_STARTUP"))

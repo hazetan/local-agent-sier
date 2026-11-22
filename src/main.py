@@ -1,4 +1,4 @@
-from core.config import get_discord_token
+from core.config import get_discord_token, get_reset_workspace_on_startup
 from core.logger import system_logger
 from discord_app.bot import bot
 from sandbox.container import ensure_sandbox_container
@@ -9,9 +9,10 @@ def main() -> None:
     system_logger.reset()
     system_logger.log("MAIN", "Starting system initialization...")
 
-    print("[Init] Preparing ~/ (workspace) standard SIer documents...")
-    init_workspace_files(reset_on_restart=False)
-    system_logger.log("MAIN", "Workspace standard documents checked.")
+    reset_ws = get_reset_workspace_on_startup()
+    print(f"[Init] Preparing ~/ (workspace) standard SIer documents (reset={reset_ws})...")
+    init_workspace_files(reset_on_restart=reset_ws)
+    system_logger.log("MAIN", f"Workspace standard documents checked (reset={reset_ws}).")
 
     print("[Init] Starting clean Docker sandbox container mounted at ~/ (/root)...")
     c_name = ensure_sandbox_container(recreate=True)

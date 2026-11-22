@@ -206,13 +206,118 @@ async def _diagnose_ollama_state() -> dict[str, Any]:
         return {"ollama_ps_error": f"{type(exc).__name__}: {exc}"}
 
 
+def _recover_payload_from_ollama_error(
+    role_label: str,
+    model_name: str,
+    status: int,
+    err_body: str,
+    payload: dict[str, Any],
+) -> bool:
+    """
+    OllamaのHTTP 400/500エラーからパラメータ由来の問題を検知してpayloadを自動修正する。
+    修正してリトライ可能な場合は True を返し、WARNログに記録する。
+    """
+    err_low = err_body.lower()
+    opts: dict[str, Any] = payload.get("options") or {}
+
+    # 1. think パラメータ由来のエラー (文字列非対応 or thinking機能非対応)
+    if "think" in payload and (status == 400 or "think" in err_low):
+        cur_think = payload.get("think")
+        if isinstance(cur_think, str) and "does not support thinking" not in err_low:
+            payload["think"] = True
+            system_logger.log(
+                "LLM_CLIENT",
+                f"[{role_label}] Model '{model_name}' rejected think={cur_think!r} (HTTP {status}). Auto-adjusted to think=True.",
+                level="WARN",
+            )
+            return True
+        payload.pop("think", None)
+        system_logger.log(
+            "LLM_CLIENT",
+            f"[{role_label}] Model '{model_name}' does not support 'think' parameter (HTTP {status}). Auto-removed 'think'.",
+            level="WARN",
+        )
+        return True
+
+    # 2. CUDA / VRAM OOM またはコンテキスト初期化失敗 (num_gpu / num_ctx / num_batch の自動縮退)
+    is_oom = any(
+        kw in err_low
+        for kw in (
+            "out of memory",
+            "cudamalloc failed",
+            "failed to allocate",
+            "failed to initialize the context",
+            "ggml_gallocr",
+        )
+    )
+    if is_oom and opts:
+        if "num_gpu" in opts:
+            removed_gpu = opts.pop("num_gpu")
+            system_logger.log(
+                "LLM_CLIENT",
+                f"[{role_label}] VRAM OOM detected on '{model_name}' with num_gpu={removed_gpu}. "
+                "Auto-removed 'num_gpu' to enable Ollama automatic VRAM/RAM offloading.",
+                level="WARN",
+            )
+            return True
+
+        cur_ctx = int(opts.get("num_ctx") or 0)
+        if cur_ctx > 8192:
+            new_ctx = max(8192, cur_ctx // 2)
+            opts["num_ctx"] = new_ctx
+            if int(opts.get("num_batch") or 0) > 256:
+                opts["num_batch"] = 256
+            system_logger.log(
+                "LLM_CLIENT",
+                f"[{role_label}] VRAM/RAM OOM detected on '{model_name}'. "
+                f"Auto-reduced num_ctx ({cur_ctx} -> {new_ctx}) and capped num_batch.",
+                level="WARN",
+            )
+            return True
+
+    # 3. 個別の無効・非対応 options キーの指定エラー
+    if opts:
+        for opt_key in list(opts.keys()):
+            if opt_key.lower() in err_low:
+                removed_val = opts.pop(opt_key)
+                system_logger.log(
+                    "LLM_CLIENT",
+                    f"[{role_label}] Invalid option '{opt_key}={removed_val}' rejected by Ollama (HTTP {status}). Auto-removed '{opt_key}'.",
+                    level="WARN",
+                )
+                return True
+
+    # 4. keep_alive フォーマットエラー
+    if "keep_alive" in payload and "keep_alive" in err_low:
+        bad_ka = payload.pop("keep_alive", None)
+        system_logger.log(
+            "LLM_CLIENT",
+            f"[{role_label}] Invalid keep_alive={bad_ka!r} rejected by Ollama. Auto-removed 'keep_alive'.",
+            level="WARN",
+        )
+        return True
+
+    # 5. tools 非対応モデルのフォールバック (テキスト上のFallback Tool Call抽出へ委譲)
+    if "tools" in payload and status == 400 and ("does not support tools" in err_low or "tool" in err_low):
+        payload.pop("tools", None)
+        system_logger.log(
+            "LLM_CLIENT",
+            f"[{role_label}] Model '{model_name}' does not support native 'tools' API (HTTP 400). "
+            "Auto-removed 'tools' and falling back to text tool-call extraction.",
+            level="WARN",
+        )
+        return True
+
+    return False
+
+
 async def _execute_ollama_stream(
     role: str,
     model_name: str,
     payload: dict[str, Any],
     est_input_tok: int,
 ) -> tuple[dict[str, Any], int, int, int, float]:
-    """Ollama /api/chat をストリーミング受信し、think非対応モデル(400)は自動的にthinkを除去してリトライする"""
+    """Ollama /api/chat をストリーミング受信し、パラメータやVRAM由来のエラー時は自動補正してリトライする"""
     is_heavy = role.upper() in telemetry.heavy_active_roles
     role_label = f"{role.upper()}:HEAVY" if is_heavy else role.upper()
 
@@ -241,28 +346,18 @@ async def _execute_ollama_stream(
         async with aiohttp.ClientSession(timeout=timeout) as session:
             resp = await session.post(chat_url, json=payload)
 
-            # 1) think="high" 等の文字列指定で400になった場合は think=True でリトライ
-            if resp.status == 400 and isinstance(payload.get("think"), str):
+            retry_attempts = 0
+            while resp.status in (400, 422, 500) and retry_attempts < 5:
                 err_body = await resp.text()
-                await resp.release()
-                if "does not support thinking" in err_body.lower():
-                    payload.pop("think", None)
+                status_code = resp.status
+                if _recover_payload_from_ollama_error(role_label, model_name, status_code, err_body, payload):
+                    await resp.release()
+                    retry_attempts += 1
+                    await asyncio.sleep(1.0)
+                    req_start_t = time.perf_counter()
+                    resp = await session.post(chat_url, json=payload)
                 else:
-                    payload["think"] = True
-                req_start_t = time.perf_counter()
-                resp = await session.post(chat_url, json=payload)
-
-            # 2) think=True/False 自体に非対応 ("does not support thinking" 等) で400になった場合は think キーを削除してリトライ
-            if resp.status == 400 and "think" in payload:
-                await resp.release()
-                payload.pop("think", None)
-                system_logger.log(
-                    "LLM_CLIENT",
-                    f"[{role_label}] Model '{model_name}' does not support 'think' parameter. Retrying without 'think'...",
-                    level="WARN",
-                )
-                req_start_t = time.perf_counter()
-                resp = await session.post(chat_url, json=payload)
+                    break
 
             async with resp:
                 if resp.status != 200:
