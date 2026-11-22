@@ -351,7 +351,7 @@ async def _execute_heavy_brain_stage(
 ) -> str:
     """
     Stage 2 & Stage 3 (Auto-Apply):
-    重量級モデル (MODEL_HEAVY) を呼び出し、失敗時はなぜ使えなかったのかを error_logger へ明示的に記録する。
+    重量級モデル (MODEL_HEAVY) を呼び出し、出力された '### FILE:' ブロックを自動保存する。
     """
     raw_ctx_paths = parsed_args.get("context_paths") or []
     if isinstance(raw_ctx_paths, str):
@@ -396,12 +396,7 @@ async def _execute_heavy_brain_stage(
         )
     except (RuntimeError, aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
         err_msg = f"Heavy Brain Execution Failed ({type(exc).__name__}): {exc}"
-        logger.log_error(err_msg, exc=exc)
-        error_logger.log_heavy_failure(
-            role, "MODEL_HEAVY", "EXECUTION_EXCEPTION", err_msg,
-            diagnostics={"targets": raw_targets, "context_paths": raw_ctx_paths, "prompt_chars": len(heavy_user_prompt)},
-            exc=exc,
-        )
+        system_logger.log("RUNNER", f"[{role}:HEAVY] {err_msg}", level="ERROR")
         return f"Error in invoke_heavy_brain: {err_msg} (詳細は logs/error.log を参照)"
 
     applied_files = await asyncio.to_thread(auto_apply_heavy_markdown, clean_md, raw_targets)

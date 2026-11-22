@@ -212,7 +212,7 @@ async def _execute_ollama_stream(
     payload: dict[str, Any],
     est_input_tok: int,
 ) -> tuple[dict[str, Any], int, int, int, float]:
-    """Ollama /api/chat をストリーミング受信し、エラー時は詳細な原因を error_logger に出力する"""
+    """Ollama /api/chat をストリーミング受信し、think非対応モデル(400)は自動的にthinkを除去してリトライする"""
     is_heavy = role.upper() in telemetry.heavy_active_roles
     role_label = f"{role.upper()}:HEAVY" if is_heavy else role.upper()
 
@@ -221,7 +221,6 @@ async def _execute_ollama_stream(
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=read_timeout_sec)
 
     granularity = get_stream_granularity_tokens()
-    think_setting = payload.get("think")
     chat_url = get_ollama_chat_url()
 
     req_start_t = time.perf_counter()
@@ -242,9 +241,26 @@ async def _execute_ollama_stream(
         async with aiohttp.ClientSession(timeout=timeout) as session:
             resp = await session.post(chat_url, json=payload)
 
-            if resp.status == 400 and isinstance(think_setting, str):
+            # 1) think="high" 等の文字列指定で400になった場合は think=True でリトライ
+            if resp.status == 400 and isinstance(payload.get("think"), str):
+                err_body = await resp.text()
                 await resp.release()
-                payload["think"] = True
+                if "does not support thinking" in err_body.lower():
+                    payload.pop("think", None)
+                else:
+                    payload["think"] = True
+                req_start_t = time.perf_counter()
+                resp = await session.post(chat_url, json=payload)
+
+            # 2) think=True/False 自体に非対応 ("does not support thinking" 等) で400になった場合は think キーを削除してリトライ
+            if resp.status == 400 and "think" in payload:
+                await resp.release()
+                payload.pop("think", None)
+                system_logger.log(
+                    "LLM_CLIENT",
+                    f"[{role_label}] Model '{model_name}' does not support 'think' parameter. Retrying without 'think'...",
+                    level="WARN",
+                )
                 req_start_t = time.perf_counter()
                 resp = await session.post(chat_url, json=payload)
 
