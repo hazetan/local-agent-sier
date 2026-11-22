@@ -1,5 +1,6 @@
 import asyncio
 import re
+from pathlib import Path
 
 import discord
 
@@ -111,6 +112,67 @@ async def on_ready() -> None:
         )
         system_logger.log("DISCORD_BOT", "Background tasks (Warmup, StatusMonitor, DevPipeline, Auditor) launched.")
 
+
+MAX_ATTACHMENT_BYTES = 512 * 1024  # 1ファイルあたり最大 512 KB
+TEXT_ATTACHMENT_EXTENSIONS = {
+    ".txt", ".md", ".markdown", ".rst", ".log", ".csv", ".tsv",
+    ".py", ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh",
+    ".rs", ".go", ".js", ".ts", ".jsx", ".tsx", ".java", ".cs",
+    ".sh", ".bash", ".zsh", ".bat", ".ps1",
+    ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".env",
+    ".html", ".htm", ".css", ".xml", ".sql",
+    ".makefile", ".mk", ".cmake", ".dockerfile", ".scad",
+}
+
+
+async def _extract_text_attachments(message: discord.Message) -> list[str]:
+    """Discordメッセージに添付されたテキスト系ファイルを読み取って整形リストとして返す"""
+    sections: list[str] = []
+    for att in message.attachments:
+        fname = att.filename or "attachment.txt"
+        ext = Path(fname).suffix.lower()
+        ctype = (att.content_type or "").lower()
+        is_text_type = (
+            ext in TEXT_ATTACHMENT_EXTENSIONS
+            or fname.lower() in ("makefile", "dockerfile", "cmakelists.txt")
+            or ctype.startswith("text/")
+            or "json" in ctype
+            or "xml" in ctype
+            or "yaml" in ctype
+            or "javascript" in ctype
+        )
+        if not is_text_type:
+            system_logger.log("DISCORD_BOT", f"Skipped non-text attachment: {fname} (content_type={ctype})")
+            continue
+
+        if att.size > MAX_ATTACHMENT_BYTES:
+            sections.append(
+                f"=== 添付ファイル: {fname} (サイズ超過: {att.size:,} bytes > 上限 {MAX_ATTACHMENT_BYTES:,} bytes のため省略) ==="
+            )
+            system_logger.log("DISCORD_BOT", f"Skipped oversized attachment: {fname} ({att.size} bytes)", level="WARN")
+            continue
+
+        try:
+            raw_bytes = await att.read()
+        except (discord.DiscordException, OSError) as exc:
+            system_logger.error("DISCORD_BOT", f"Failed to read attachment {fname}: {exc}", exc)
+            continue
+
+        if b"\x00" in raw_bytes[:1024]:
+            system_logger.log("DISCORD_BOT", f"Skipped binary attachment: {fname}")
+            continue
+
+        try:
+            text_content = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            text_content = raw_bytes.decode("cp932", errors="replace")
+
+        sections.append(f"=== 添付ファイル: {fname} ===\n{text_content.strip()}")
+        system_logger.log("DISCORD_BOT", f"Loaded text attachment: {fname} ({len(text_content)} chars)")
+
+    return sections
+
+
 @bot.event
 async def on_message(message: discord.Message) -> None:
     if message.author.bot:
@@ -120,7 +182,8 @@ async def on_message(message: discord.Message) -> None:
     parent_id = getattr(message.channel, "parent_id", None)
     system_logger.log(
         "DISCORD_BOT",
-        f"on_message event: author={message.author} | ch_id={ch_id} | parent_id={parent_id} | content={message.content[:60]!r}",
+        f"on_message event: author={message.author} | ch_id={ch_id} | parent_id={parent_id} | "
+        f"content={message.content[:60]!r} | attachments={len(message.attachments)}",
     )
 
     if not is_monitored_channel(message.channel):
@@ -133,11 +196,21 @@ async def on_message(message: discord.Message) -> None:
         return
 
     clean_text = re.sub(r"<@!?\d+>", "", message.content).strip()
+    attachment_sections = await _extract_text_attachments(message) if message.attachments else []
+
+    if attachment_sections:
+        attachments_block = "\n\n".join(attachment_sections)
+        clean_text = f"{clean_text}\n\n{attachments_block}".strip() if clean_text else attachments_block
+
     if not clean_text:
-        system_logger.log("DISCORD_BOT", "Ignored: clean_text is empty.")
+        system_logger.log("DISCORD_BOT", "Ignored: clean_text and text attachments are both empty.")
         return
 
-    system_logger.log("DISCORD_BOT", f"Accepted client message in ch={ch_id}: {clean_text[:80]!r}")
+    system_logger.log(
+        "DISCORD_BOT",
+        f"Accepted client message in ch={ch_id} (total_chars={len(clean_text)}, attachments={len(attachment_sections)}): "
+        f"{clean_text[:80]!r}",
+    )
     async with message.channel.typing():
         reply_text, zip_files = await handle_client_message(clean_text)
         await send_chunked(message.channel, reply_text, reply_to=message)
