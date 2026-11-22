@@ -323,12 +323,12 @@ ROLE_ALLOWED_TOOLS: dict[str, list[str]] = {
     ],
     "SE": [
         "list_files", "read_file", "read_files", "search_files",
-        "invoke_heavy_brain", "write_file", "edit_lines", "replace_in_file",
+        "invoke_heavy_brain", "edit_lines", "replace_in_file",
         "run_command", "web_search", "fetch_url", "complete_phase",
     ],
     "PG": [
         "list_files", "read_file", "read_files", "search_files",
-        "invoke_heavy_brain", "edit_lines", "replace_in_file", "write_file",
+        "invoke_heavy_brain", "edit_lines", "replace_in_file",
         "run_command", "web_search", "fetch_url", "complete_phase",
     ],
     "QA": [

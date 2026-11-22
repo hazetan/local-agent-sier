@@ -285,9 +285,16 @@ async def _execute_heavy_brain_stage(
     if telemetry.on_raw_update:
         await telemetry.on_raw_update()
 
-    thinking_text, clean_md, h_latency, h_model, h_tps = await generate_heavy_brain(
-        role, heavy_sys_prompt, heavy_user_prompt
-    )
+    try:
+        thinking_text, clean_md, h_latency, h_model, h_tps = await generate_heavy_brain(
+            role, heavy_sys_prompt, heavy_user_prompt
+        )
+    except Exception as exc:
+        err_msg = f"Error in invoke_heavy_brain ({type(exc).__name__}): {exc}"
+        logger.log_error(err_msg)
+        system_logger.error("RUNNER", f"[{role}:HEAVY] Failed: {err_msg}", exc)
+        return err_msg
+
     applied_files = await asyncio.to_thread(auto_apply_heavy_markdown, clean_md, raw_targets)
 
     summary_header = (

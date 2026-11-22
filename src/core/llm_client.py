@@ -44,44 +44,26 @@ def _get_llm_semaphores() -> tuple[asyncio.Semaphore, asyncio.Semaphore]:
     return _total_llm_sem, _bg_llm_sem
 
 
-def extract_thinking_and_clean(raw_content: str, explicit_thinking: str = "") -> tuple[str, str]:
-    """
-    レスポンスから (思考テキスト, クリーンな本文) を分離・抽出する。
-    <think>, <thought>, <|channel>thought...<channel|> および未クローズ状態に対応。
-    """
-    think_parts: list[str] = []
-    if explicit_thinking and explicit_thinking.strip():
-        think_parts.append(explicit_thinking.strip())
-
-    cleaned = raw_content or ""
-    if cleaned:
-        tag_patterns = [
-            (r"<think>(.*?)</think>", "<think>", "</think>"),
-            (r"<thought>(.*?)</thought>", "<thought>", "</thought>"),
-            (r"<\|channel>thought\s*(.*?)<channel\|>", "<|channel>thought", "<channel|>"),
-        ]
-        for regex, open_tag, close_tag in tag_patterns:
-            matches = re.findall(regex, cleaned, flags=re.DOTALL)
-            for m in matches:
-                if m.strip():
-                    think_parts.append(m.strip())
-            cleaned = re.sub(regex, "", cleaned, flags=re.DOTALL)
-
-            if open_tag in cleaned and close_tag not in cleaned:
-                prefix, unclosed_think = cleaned.split(open_tag, 1)
-                if unclosed_think.strip():
-                    think_parts.append(unclosed_think.strip())
-                cleaned = prefix
-
-        cleaned = cleaned.strip()
-
-    combined_think = "\n".join(think_parts).strip()
-    return combined_think, cleaned
+def _quote_unquoted_keys(s: str) -> str:
+    """Gemma4固有の {directory:"~/...", extensions:[...]} のようなクォート無しキーを標準JSONへ補正する"""
+    pattern = re.compile(
+        r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')|([\{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)(\s*:)'
+    )
+    return pattern.sub(
+        lambda m: m.group(1) if m.group(1) is not None else f'{m.group(2)}"{m.group(3)}"{m.group(4)}',
+        s,
+    )
 
 
 def _parse_json_lenient(raw: str) -> Any | None:
     s = raw.strip()
-    for candidate in (s, re.sub(r",\s*([}\]])", r"\1", s)):
+    quoted = _quote_unquoted_keys(s)
+    for candidate in (
+        s,
+        re.sub(r",\s*([}\]])", r"\1", s),
+        quoted,
+        re.sub(r",\s*([}\]])", r"\1", quoted),
+    ):
         try:
             return json.loads(candidate)
         except Exception:
@@ -106,17 +88,14 @@ def extract_thinking_and_clean(raw_content: str, explicit_thinking: str = "") ->
 
     cleaned = raw_content or ""
     if cleaned:
-        # Gemma4の文字化け思考タグ (Ï/£thought) を正規化
         cleaned = re.sub(r"[£Ï]thought\b", "<|channel>thought", cleaned)
-
         tag_patterns = [
             (r"<think>(.*?)</think>", "<think>", "</think>"),
             (r"<thought>(.*?)</thought>", "<thought>", "</thought>"),
             (r"<\|channel>thought\s*(.*?)<channel\|>", "<|channel>thought", "<channel|>"),
         ]
         for regex, open_tag, close_tag in tag_patterns:
-            matches = re.findall(regex, cleaned, flags=re.DOTALL)
-            for m in matches:
+            for m in re.findall(regex, cleaned, flags=re.DOTALL):
                 m_clean = m.strip()
                 if m_clean and m_clean not in think_parts[-1:]:
                     think_parts.append(m_clean)
@@ -128,15 +107,13 @@ def extract_thinking_and_clean(raw_content: str, explicit_thinking: str = "") ->
                     think_parts.append(unclosed_think.strip())
                 cleaned = prefix
 
-        # 残存した特殊制御トークンを除去
         cleaned = re.sub(
             r"(?:<\|channel>thought|<channel\|>|<\|?tool_call\|?>|<\|?tool_response\|?>)",
             "",
             cleaned,
         ).strip()
 
-    combined_think = "\n".join(think_parts).strip()
-    return combined_think, cleaned
+    return "\n".join(think_parts).strip(), cleaned
 
 
 HIGH_THINKING_DIRECTIVE = (
@@ -476,25 +453,25 @@ async def warmup_models() -> None:
             system_logger.error("LLM_CLIENT", f"[WARMUP] Exception while preloading {model_name}: {exc}", exc)
 
 
-async def _unload_models_for_heavy(heavy_model_name: str) -> None:
+async def _unload_models_for_heavy(keep_model_name: str) -> None:
     """
-    Qwen3-Coder-Next 等の重量モデルを128k CTXでロードする前に、
-    Ollama /api/ps 上で稼働中の別モデルおよび設定上の軽量モデルをすべて keep_alive=0 でアンロードする。
+    keep_model_name 以外のロード済みモデル（軽量・重量すべて）を keep_alive=0 で確実にアンロードする。
     """
     from .config import get_ollama_ps_url
 
     models_to_unload: list[str] = []
     for r in ("PM", "SE", "PG", "QA", "AUDITOR"):
-        try:
-            m = get_model_for_role(r)
-            if m and m != heavy_model_name and m not in models_to_unload:
-                models_to_unload.append(m)
-        except Exception:
-            continue
+        for getter in (get_model_for_role, get_heavy_model_for_role):
+            try:
+                m = getter(r)
+                if m and m != keep_model_name and m not in models_to_unload:
+                    models_to_unload.append(m)
+            except Exception:
+                continue
 
     chat_url = get_ollama_chat_url()
     ps_url = get_ollama_ps_url()
-    timeout = aiohttp.ClientTimeout(total=30)
+    timeout = aiohttp.ClientTimeout(total=60)
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         try:
@@ -502,15 +479,16 @@ async def _unload_models_for_heavy(heavy_model_name: str) -> None:
                 if resp.status == 200:
                     data = await resp.json()
                     for m_info in data.get("models", []):
-                        loaded_name = m_info.get("name")
-                        if loaded_name and loaded_name != heavy_model_name and loaded_name not in models_to_unload:
-                            models_to_unload.append(loaded_name)
+                        for key in ("name", "model"):
+                            loaded_name = m_info.get(key)
+                            if loaded_name and loaded_name != keep_model_name and loaded_name not in models_to_unload:
+                                models_to_unload.append(loaded_name)
         except Exception:
             pass
 
         for m in models_to_unload:
             try:
-                system_logger.log("LLM_CLIENT", f"[HEAVY_PREP] Unloading '{m}' to free 16GB VRAM + 64GB RAM for '{heavy_model_name}'...")
+                system_logger.log("LLM_CLIENT", f"[HEAVY_PREP] Unloading '{m}' to free VRAM/RAM for '{keep_model_name}'...")
                 async with session.post(
                     chat_url,
                     json={"model": m, "messages": [], "stream": False, "keep_alive": 0},
@@ -621,42 +599,6 @@ async def generate_heavy_brain(
     thinking_text, clean_content = extract_thinking_and_clean(raw_content, explicit_thinking)
     latency = time.perf_counter() - start_t
     return thinking_text, clean_content, latency, model_name, tps
-
-
-def _quote_unquoted_keys(s: str) -> str:
-    """Gemma4固有の {directory:"~/...", extensions:[...]} のようなクォート無しキーを標準JSONへ補正する"""
-    pattern = re.compile(
-        r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')|([\{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)(\s*:)'
-    )
-
-    def _repl(m: re.Match) -> str:
-        if m.group(1) is not None:
-            return m.group(1)
-        return f'{m.group(2)}"{m.group(3)}"{m.group(4)}'
-
-    return pattern.sub(_repl, s)
-
-
-def _parse_json_lenient(raw: str) -> Any | None:
-    s = raw.strip()
-    quoted = _quote_unquoted_keys(s)
-    for candidate in (
-        s,
-        re.sub(r",\s*([}\]])", r"\1", s),
-        quoted,
-        re.sub(r",\s*([}\]])", r"\1", quoted),
-    ):
-        try:
-            return json.loads(candidate)
-        except Exception:
-            pass
-    try:
-        val = ast.literal_eval(s)
-        if isinstance(val, (dict, list)):
-            return val
-    except Exception:
-        pass
-    return None
 
 
 def extract_fallback_tool_calls(content: str) -> list[dict[str, Any]]:

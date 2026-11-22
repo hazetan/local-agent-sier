@@ -158,70 +158,47 @@ def get_heavy_ollama_keep_alive() -> str | None:
     return get_env_str("HEAVY_KEEP_ALIVE")
 
 
-def get_ollama_options() -> dict[str, Any]:
+def _build_ollama_options(int_map: dict[str, str], float_map: dict[str, str]) -> dict[str, Any]:
     opts: dict[str, Any] = {}
-    int_mappings = {
-        "SERVER_CTX_SIZE": "num_ctx",
-        "MAX_TOKEN": "num_predict",
-        "LLM_TOP_K": "top_k",
-        "LLM_REPEAT_LAST_N": "repeat_last_n",
-        "LLM_SEED": "seed",
-        "OLLAMA_NUM_GPU": "num_gpu",
-        "OLLAMA_NUM_THREAD": "num_thread",
-        "OLLAMA_NUM_BATCH": "num_batch",
-    }
-    for env_key, opt_key in int_mappings.items():
-        val = get_env_int(env_key)
-        if val is not None:
+    for env_key, opt_key in int_map.items():
+        if (val := get_env_int(env_key)) is not None:
             opts[opt_key] = val
-
-    float_mappings = {
-        "LLM_TEMP": "temperature",
-        "LLM_TOP_P": "top_p",
-        "LLM_MIN_P": "min_p",
-        "LLM_REPEAT_PENALTY": "repeat_penalty",
-        "LLM_PRESENCE_PENALTY": "presence_penalty",
-        "LLM_FREQ_PENALTY": "frequency_penalty",
-    }
-    for env_key, opt_key in float_mappings.items():
-        val = get_env_float(env_key)
-        if val is not None:
+    for env_key, opt_key in float_map.items():
+        if (val := get_env_float(env_key)) is not None:
             opts[opt_key] = val
-
     return opts
+
+
+def get_ollama_options() -> dict[str, Any]:
+    return _build_ollama_options(
+        int_map={
+            "SERVER_CTX_SIZE": "num_ctx", "MAX_TOKEN": "num_predict",
+            "LLM_TOP_K": "top_k", "LLM_REPEAT_LAST_N": "repeat_last_n",
+            "LLM_SEED": "seed", "OLLAMA_NUM_GPU": "num_gpu",
+            "OLLAMA_NUM_THREAD": "num_thread", "OLLAMA_NUM_BATCH": "num_batch",
+        },
+        float_map={
+            "LLM_TEMP": "temperature", "LLM_TOP_P": "top_p", "LLM_MIN_P": "min_p",
+            "LLM_REPEAT_PENALTY": "repeat_penalty",
+            "LLM_PRESENCE_PENALTY": "presence_penalty", "LLM_FREQ_PENALTY": "frequency_penalty",
+        },
+    )
 
 
 def get_heavy_ollama_options() -> dict[str, Any]:
-    opts: dict[str, Any] = {}
-    int_mappings = {
-        "HEAVY_CTX_SIZE": "num_ctx",
-        "HEAVY_MAX_TOKEN": "num_predict",
-        "HEAVY_TOP_K": "top_k",
-        "HEAVY_REPEAT_LAST_N": "repeat_last_n",
-        "HEAVY_SEED": "seed",
-        "HEAVY_NUM_GPU": "num_gpu",
-        "HEAVY_NUM_THREAD": "num_thread",
-        "HEAVY_NUM_BATCH": "num_batch",
-    }
-    for env_key, opt_key in int_mappings.items():
-        val = get_env_int(env_key)
-        if val is not None:
-            opts[opt_key] = val
-
-    float_mappings = {
-        "HEAVY_TEMP": "temperature",
-        "HEAVY_TOP_P": "top_p",
-        "HEAVY_MIN_P": "min_p",
-        "HEAVY_REPEAT_PENALTY": "repeat_penalty",
-        "HEAVY_PRESENCE_PENALTY": "presence_penalty",
-        "HEAVY_FREQ_PENALTY": "frequency_penalty",
-    }
-    for env_key, opt_key in float_mappings.items():
-        val = get_env_float(env_key)
-        if val is not None:
-            opts[opt_key] = val
-
-    return opts
+    return _build_ollama_options(
+        int_map={
+            "HEAVY_CTX_SIZE": "num_ctx", "HEAVY_MAX_TOKEN": "num_predict",
+            "HEAVY_TOP_K": "top_k", "HEAVY_REPEAT_LAST_N": "repeat_last_n",
+            "HEAVY_SEED": "seed", "HEAVY_NUM_GPU": "num_gpu",
+            "HEAVY_NUM_THREAD": "num_thread", "HEAVY_NUM_BATCH": "num_batch",
+        },
+        float_map={
+            "HEAVY_TEMP": "temperature", "HEAVY_TOP_P": "top_p", "HEAVY_MIN_P": "min_p",
+            "HEAVY_REPEAT_PENALTY": "repeat_penalty",
+            "HEAVY_PRESENCE_PENALTY": "presence_penalty", "HEAVY_FREQ_PENALTY": "frequency_penalty",
+        },
+    )
 
 
 def get_llm_timeout() -> int:

@@ -176,100 +176,6 @@ def _tool_read_file(args: dict[str, Any]) -> str:
     return f"{header}\n{body}"
 
 
-
-def _tool_read_files(args: dict[str, Any]) -> str:
-    """複数ファイルまたはディレクトリ配下を粒度可変ストリーミング＋行番号付きで一括閲覧する"""
-    ws = get_workspace_dir().resolve()
-    raw_paths = args.get("paths") or []
-    if isinstance(raw_paths, str):
-        raw_paths = [p.strip() for p in raw_paths.split(",") if p.strip()]
-
-    raw_dir = args.get("directory")
-    if not raw_paths and not raw_dir:
-        raw_dir = "~/"
-
-    raw_exts = args.get("extensions")
-    allowed_exts: set[str] | None = None
-    if raw_exts:
-        if isinstance(raw_exts, str):
-            raw_exts = [e.strip() for e in raw_exts.split(",") if e.strip()]
-        allowed_exts = {e.lower() if e.startswith(".") else f".{e.lower()}" for e in raw_exts}
-
-    max_lines_per_file = int(args.get("max_lines_per_file", 1000))
-    batch_char_budget = int(get_max_ctx_chars_budget() * 0.7)
-    collected: list[Path] = []
-    seen: set[Path] = set()
-
-    def _add_candidate(p: Path) -> None:
-        resolved = p.resolve()
-        if resolved not in seen and _is_readable_text_file(resolved, allowed_exts):
-            seen.add(resolved)
-            collected.append(resolved)
-
-    def _walk_dir(d: Path) -> None:
-        for root, dirs, files in os.walk(d):
-            dirs[:] = sorted(x for x in dirs if x not in IGNORE_DIRS and not x.startswith("."))
-            for f in sorted(files):
-                _add_candidate(Path(root) / f)
-
-    for rp in raw_paths:
-        target = resolve_workspace_path(str(rp))
-        if not target or not target.exists():
-            continue
-        if target.is_dir():
-            _walk_dir(target)
-        else:
-            _add_candidate(target)
-
-    if raw_dir:
-        target_dir = resolve_workspace_path(str(raw_dir))
-        if target_dir and target_dir.exists():
-            if target_dir.is_dir():
-                _walk_dir(target_dir)
-            else:
-                _add_candidate(target_dir)
-
-    if not collected:
-        return "No readable text files matched the specified paths/directory."
-
-    sections: list[str] = []
-    total_chars = 0
-    omitted_files: list[str] = []
-
-    for idx, fpath in enumerate(collected):
-        remaining_budget = max(4000, batch_char_budget - total_chars)
-        if total_chars >= batch_char_budget and sections:
-            omitted_files = [f"~/{p.relative_to(ws)}" for p in collected[idx:]]
-            break
-
-        rel = fpath.relative_to(ws)
-        shown_lines, total_lines, budget_hit = _stream_read_lines(
-            fpath, start_line=1, end_line=max_lines_per_file, max_chars=remaining_budget
-        )
-        body = _format_with_line_numbers(shown_lines, start_line=1)
-        if len(shown_lines) < total_lines:
-            body += (
-                f"\n...(truncated after {len(shown_lines)} of {total_lines} lines; "
-                f"use read_file with start_line={len(shown_lines) + 1} if needed)..."
-            )
-
-        block = f"=== FILE: ~/{rel} (total {total_lines} lines) ===\n{body}"
-        sections.append(block)
-        total_chars += len(block)
-
-        if budget_hit and idx + 1 < len(collected):
-            omitted_files = [f"~/{p.relative_to(ws)}" for p in collected[idx + 1 :]]
-            break
-
-    if omitted_files:
-        sections.append(
-            f"=== OMITTED FILES (reached 256k context safety budget of {batch_char_budget:,} chars) ===\n"
-            + "\n".join(f"- {p}" for p in omitted_files)
-        )
-
-    return "\n\n".join(sections)
-
-
 def _tool_write_file(args: dict[str, Any]) -> str:
     raw_path = str(args.get("path", "")).strip()
     content = str(args.get("content", ""))
@@ -510,6 +416,100 @@ def _tool_export_zip(args: dict[str, Any]) -> str:
     return f"ZIP_CREATED:{zip_path}"
 
 
+def _collect_workspace_files(
+    raw_paths: list[str],
+    raw_dir: str | None = None,
+    allowed_exts: set[str] | None = None,
+    skip_files: set[Path] | None = None,
+) -> list[Path]:
+    """指定されたパスリスト・ディレクトリから読み取り可能なテキストファイルを重複なく再帰収集する"""
+    collected: list[Path] = []
+    seen: set[Path] = set(skip_files or ())
+
+    def _add(p: Path) -> None:
+        resolved = p.resolve()
+        if resolved not in seen and _is_readable_text_file(resolved, allowed_exts):
+            seen.add(resolved)
+            collected.append(resolved)
+
+    def _walk(d: Path) -> None:
+        for root, dirs, files in os.walk(d):
+            dirs[:] = sorted(x for x in dirs if x not in IGNORE_DIRS and not x.startswith("."))
+            for f in sorted(files):
+                _add(Path(root) / f)
+
+    targets = [*raw_paths, *([raw_dir] if raw_dir else [])]
+    for rp in targets:
+        target = resolve_workspace_path(str(rp))
+        if not target or not target.exists():
+            continue
+        if target.is_dir():
+            _walk(target)
+        else:
+            _add(target)
+
+    return collected
+
+
+def _tool_read_files(args: dict[str, Any]) -> str:
+    """複数ファイルまたはディレクトリ配下を粒度可変ストリーミング＋行番号付きで一括閲覧する"""
+    ws = get_workspace_dir().resolve()
+    raw_paths = args.get("paths") or []
+    if isinstance(raw_paths, str):
+        raw_paths = [p.strip() for p in raw_paths.split(",") if p.strip()]
+
+    raw_dir = args.get("directory") or ("~/" if not raw_paths else None)
+    raw_exts = args.get("extensions")
+    allowed_exts: set[str] | None = None
+    if raw_exts:
+        if isinstance(raw_exts, str):
+            raw_exts = [e.strip() for e in raw_exts.split(",") if e.strip()]
+        allowed_exts = {e.lower() if e.startswith(".") else f".{e.lower()}" for e in raw_exts}
+
+    collected = _collect_workspace_files(raw_paths, raw_dir, allowed_exts)
+    if not collected:
+        return "No readable text files matched the specified paths/directory."
+
+    max_lines_per_file = int(args.get("max_lines_per_file", 1000))
+    batch_char_budget = int(get_max_ctx_chars_budget() * 0.7)
+    sections: list[str] = []
+    total_chars = 0
+    omitted_files: list[str] = []
+
+    for idx, fpath in enumerate(collected):
+        remaining_budget = max(4000, batch_char_budget - total_chars)
+        if total_chars >= batch_char_budget and sections:
+            omitted_files = [f"~/{p.relative_to(ws)}" for p in collected[idx:]]
+            break
+
+        rel = fpath.relative_to(ws)
+        shown_lines, total_lines, budget_hit = _stream_read_lines(
+            fpath, start_line=1, end_line=max_lines_per_file, max_chars=remaining_budget
+        )
+        body = _format_with_line_numbers(shown_lines, start_line=1)
+        if len(shown_lines) < total_lines:
+            body += (
+                f"\n...(truncated after {len(shown_lines)} of {total_lines} lines; "
+                f"use read_file with start_line={len(shown_lines) + 1} if needed)..."
+            )
+
+        block = f"=== FILE: ~/{rel} (total {total_lines} lines) ===\n{body}"
+        sections.append(block)
+        total_chars += len(block)
+
+        if budget_hit and idx + 1 < len(collected):
+            omitted_files = [f"~/{p.relative_to(ws)}" for p in collected[idx + 1 :]]
+            break
+
+    if omitted_files:
+        sections.append(
+            f"=== OMITTED FILES (reached context safety budget of {batch_char_budget:,} chars) ===\n"
+            + "\n".join(f"- {p}" for p in omitted_files)
+        )
+
+    return "\n\n".join(sections)
+
+
 TOOL_DISPATCH = {
     "list_files": _tool_list_files,
     "read_file": _tool_read_file,
@@ -524,7 +524,6 @@ TOOL_DISPATCH = {
     "fetch_url": _tool_fetch_url,
     "export_zip": _tool_export_zip,
 }
-
 
 
 def parse_tool_args(raw_args: Any) -> dict[str, Any]:
@@ -560,37 +559,14 @@ def build_heavy_context_bundle(context_paths: list[str]) -> str:
     """
     Stage 2 用に、指定されたファイル・ディレクトリ群をPythonで高速に一括読み込みし、
     行番号なしのクリーンなテキストバンドルとして結合する。
-    （Snapshotと重複するルート直下の標準4ドキュメントは自動スキップする）
     """
     ws = get_workspace_dir().resolve()
     standard_root_docs = {(ws / name).resolve() for name in INITIAL_DOCUMENTS}
-    char_budget = int(get_max_ctx_chars_budget(is_heavy=True) * 0.65)
-    collected: list[Path] = []
-    seen: set[Path] = set()
-
-    def _add(p: Path) -> None:
-        r = p.resolve()
-        if r in standard_root_docs:
-            return
-        if r not in seen and _is_readable_text_file(r):
-            seen.add(r)
-            collected.append(r)
-
-    for raw_p in context_paths:
-        target = resolve_workspace_path(str(raw_p))
-        if not target or not target.exists():
-            continue
-        if target.is_dir():
-            for root, dirs, files in os.walk(target):
-                dirs[:] = sorted(d for d in dirs if d not in IGNORE_DIRS and not d.startswith("."))
-                for f in sorted(files):
-                    _add(Path(root) / f)
-        else:
-            _add(target)
-
+    collected = _collect_workspace_files(context_paths, skip_files=standard_root_docs)
     if not collected:
         return "(追加の参照ファイルなし)"
 
+    char_budget = int(get_max_ctx_chars_budget(is_heavy=True) * 0.65)
     sections: list[str] = []
     used_chars = 0
     for fpath in collected:
