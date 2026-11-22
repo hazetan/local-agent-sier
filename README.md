@@ -1,4 +1,4 @@
-# LLM-Agent-Discord
+# Local-SIer
 
 ## 1. プロジェクト概要
 - ローカルLLM（Ollama）をバックエンドとし、自律型マルチエージェントシステムを Discord Bot として動作させる。
