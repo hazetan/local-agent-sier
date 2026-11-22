@@ -116,22 +116,25 @@ def extract_thinking_and_clean(raw_content: str, explicit_thinking: str = "") ->
 
 
 HIGH_THINKING_DIRECTIVE = (
-    "\n\n【最高レベル思考プロセス (Deep Thinking) 指示】\n"
-    "ツールを呼び出す前に、必ず現在の状況・ディレクトリ構造・問題の本質・影響範囲・エッジケースを"
-    "最高レベルの深さで段階的に思考（Thinking）し、論理的な整合性を検証してから行動してください。"
+    "\n\n【思考とツール呼び出しの鉄則】\n"
+    "思考（Thinking）は3〜5行以内で簡潔に要点のみ整理し、長文の自己確認は行わず即座にツール（Function Calling）を呼び出してください。"
 )
 
 
 def _prepare_messages_for_ollama(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Ollama /api/chat 向けにメッセージ配列と tool_calls / tool_name を正規化する"""
+    """
+    Ollama /api/chat 向けにメッセージ配列を正規化する。
+    過去の assistant ターンから思考テキストを完全に除外し、Gemma4が思考ループに陥るのを防ぐ。
+    """
     prepared: list[dict[str, Any]] = []
     boost = get_think_prompt_boost()
 
     for idx, m in enumerate(messages):
         role = m.get("role", "user")
+        clean_c = m.get("_clean_content") if "_clean_content" in m else (m.get("content") or "")
         msg_copy: dict[str, Any] = {
             "role": role,
-            "content": m.get("_clean_content", m.get("content") or ""),
+            "content": clean_c,
         }
         if idx == 0 and role == "system" and boost:
             msg_copy["content"] += HIGH_THINKING_DIRECTIVE
