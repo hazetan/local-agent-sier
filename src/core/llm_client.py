@@ -22,7 +22,7 @@ from .config import (
     get_stream_granularity_tokens,
     get_think_prompt_boost,
 )
-from .logger import system_logger
+from .logger import error_logger, system_logger
 from .telemetry import telemetry
 
 _total_llm_sem: asyncio.Semaphore | None = None
@@ -177,13 +177,39 @@ def _has_repetition_loop(text: str) -> bool:
     return False
 
 
+async def _diagnose_ollama_state() -> dict[str, Any]:
+    """エラー発生時に Ollama /api/ps のロード状況を取得して診断情報として返す"""
+    from .config import get_ollama_ps_url
+
+    ps_url = get_ollama_ps_url()
+    try:
+        async with (
+            aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session,
+            session.get(ps_url) as resp,
+        ):
+            if resp.status == 200:
+                data = await resp.json()
+                loaded = [
+                    {
+                        "name": m.get("name"),
+                        "size_gb": round(m.get("size", 0) / (1024**3), 2),
+                        "vram_gb": round(m.get("size_vram", 0) / (1024**3), 2),
+                    }
+                    for m in data.get("models", [])
+                ]
+                return {"ollama_ps_loaded": loaded}
+            return {"ollama_ps_http_status": resp.status}
+    except (aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
+        return {"ollama_ps_error": f"{type(exc).__name__}: {exc}"}
+
+
 async def _execute_ollama_stream(
     role: str,
     model_name: str,
     payload: dict[str, Any],
     est_input_tok: int,
 ) -> tuple[dict[str, Any], int, int, int, float]:
-    """Ollama /api/chat をストリーミング受信し、指定粒度ごとにテレメトリと生思考ログを更新する"""
+    """Ollama /api/chat をストリーミング受信し、エラー時は詳細な原因を error_logger に出力する"""
     is_heavy = role.upper() in telemetry.heavy_active_roles
     role_label = f"{role.upper()}:HEAVY" if is_heavy else role.upper()
 
@@ -206,100 +232,139 @@ async def _execute_ollama_stream(
 
     system_logger.log(
         "LLM_CLIENT",
-        f"[{role_label}] POST {chat_url} | model={model_name} | est_in_tok={est_input_tok} | think={think_setting} | options={payload.get('options')}",
+        f"[{role_label}] Start {model_name} (in_tok~{est_input_tok}, ctx={payload.get('options', {}).get('num_ctx')})",
     )
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        resp = await session.post(chat_url, json=payload)
-        system_logger.log("LLM_CLIENT", f"[{role_label}] HTTP status={resp.status} received.")
-
-        if resp.status == 400 and isinstance(think_setting, str):
-            err_body = await resp.text()
-            system_logger.log("LLM_CLIENT", f"[{role_label}] 400 with think={think_setting} ({err_body[:120]}). Retrying with think=True...", level="WARN")
-            await resp.release()
-            payload["think"] = True
-            req_start_t = time.perf_counter()
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             resp = await session.post(chat_url, json=payload)
-            system_logger.log("LLM_CLIENT", f"[{role_label}] Retry HTTP status={resp.status} received.")
 
-        async with resp:
-            if resp.status != 200:
-                err_text = await resp.text()
-                system_logger.log("LLM_CLIENT", f"[{role_label}] Non-200 error body: {err_text}", level="ERROR")
-                raise RuntimeError(f"Ollama Error ({resp.status}, model={model_name}): {err_text}")
+            if resp.status == 400 and isinstance(think_setting, str):
+                await resp.release()
+                payload["think"] = True
+                req_start_t = time.perf_counter()
+                resp = await session.post(chat_url, json=payload)
 
-            async for raw_line in resp.content:
-                line = raw_line.decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                if "error" in data:
-                    system_logger.log("LLM_CLIENT", f"[{role_label}] Stream JSON error: {data['error']}", level="ERROR")
-                    raise RuntimeError(f"Ollama Stream Error ({model_name}): {data['error']}")
-
-                m = data.get("message") or {}
-                c_piece = m.get("content") or ""
-                t_piece = m.get("thinking") or m.get("reasoning") or ""
-                if c_piece:
-                    acc_content.append(c_piece)
-                if t_piece:
-                    acc_thinking.append(t_piece)
-                if m.get("tool_calls"):
-                    acc_tool_calls.extend(m["tool_calls"])
-
-                if c_piece or t_piece:
-                    chunk_count += 1
-                    if chunk_count == 1:
-                        first_tok_sec = time.perf_counter() - req_start_t
-                        system_logger.log("LLM_CLIENT", f"[{role_label}] First token chunk arrived in {first_tok_sec:.2f}s.")
-
-                    if chunk_count % 8 == 0:
-                        tail_c = "".join(acc_content[-60:])
-                        tail_t = "".join(acc_thinking[-60:])
-                        if _has_repetition_loop(tail_c) or _has_repetition_loop(tail_t):
-                            system_logger.log(
-                                "LLM_CLIENT",
-                                f"[{role_label}] Repetition loop detected at chunk={chunk_count}. Aborting stream early!",
-                                level="WARN",
-                            )
-                            eval_tok = chunk_count
-                            break
-
-                    if chunk_count % granularity == 0:
-                        elapsed = max(0.001, time.perf_counter() - req_start_t)
-                        live_tps = chunk_count / elapsed
-                        telemetry.update_role_tokens(role, est_input_tok + chunk_count, tps=live_tps)
-
-                        live_think, live_clean = extract_thinking_and_clean(
-                            "".join(acc_content), "".join(acc_thinking)
+            async with resp:
+                if resp.status != 200:
+                    err_text = await resp.text()
+                    diag = await _diagnose_ollama_state()
+                    diag.update({
+                        "http_status": resp.status,
+                        "ollama_response": err_text[:500],
+                        "options": payload.get("options"),
+                        "est_input_tok": est_input_tok,
+                    })
+                    if is_heavy:
+                        error_logger.log_heavy_failure(
+                            role, model_name, "HTTP_RESPONSE",
+                            f"Ollama returned HTTP {resp.status}: {err_text[:300]}",
+                            diagnostics=diag,
                         )
-                        telemetry.raw_role = role_label
-                        telemetry.raw_model = model_name
-                        telemetry.raw_latency = elapsed
-                        telemetry.raw_tps = live_tps
-                        if live_think and live_clean:
-                            telemetry.raw_thought = f"[Thinking]\n{live_think[-1200:]}\n\n[Drafting]\n{live_clean[-600:]}"
-                        elif live_think:
-                            telemetry.raw_thought = f"[Thinking...]\n{live_think[-1800:]}"
-                        elif live_clean:
-                            telemetry.raw_thought = live_clean[-1800:]
-                        if telemetry.on_raw_update:
-                            await telemetry.on_raw_update()
+                    else:
+                        error_logger.log_error("LLM_CLIENT", f"[{role_label}] HTTP {resp.status}: {err_text[:300]}", context=diag)
+                    raise RuntimeError(f"Ollama Error ({resp.status}, model={model_name}): {err_text}")
 
-                if data.get("done"):
-                    prompt_tok = int(data.get("prompt_eval_count") or 0)
-                    eval_tok = int(data.get("eval_count") or chunk_count)
-                    eval_duration_ns = int(data.get("eval_duration") or 0)
-                    break
+                async for raw_line in resp.content:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    if "error" in data:
+                        err_msg = str(data["error"])
+                        diag = await _diagnose_ollama_state()
+                        diag.update({"options": payload.get("options"), "chunk_count": chunk_count})
+                        if is_heavy:
+                            error_logger.log_heavy_failure(
+                                role, model_name, "STREAM_ERROR", f"Ollama stream error: {err_msg}", diagnostics=diag
+                            )
+                        else:
+                            error_logger.log_error("LLM_CLIENT", f"[{role_label}] Stream error: {err_msg}", context=diag)
+                        raise RuntimeError(f"Ollama Stream Error ({model_name}): {err_msg}")
+
+                    m = data.get("message") or {}
+                    c_piece = m.get("content") or ""
+                    t_piece = m.get("thinking") or m.get("reasoning") or ""
+                    if c_piece:
+                        acc_content.append(c_piece)
+                    if t_piece:
+                        acc_thinking.append(t_piece)
+                    if m.get("tool_calls"):
+                        acc_tool_calls.extend(m["tool_calls"])
+
+                    if c_piece or t_piece:
+                        chunk_count += 1
+                        if chunk_count % 8 == 0:
+                            tail_c = "".join(acc_content[-60:])
+                            tail_t = "".join(acc_thinking[-60:])
+                            if _has_repetition_loop(tail_c) or _has_repetition_loop(tail_t):
+                                system_logger.log(
+                                    "LLM_CLIENT",
+                                    f"[{role_label}] Repetition loop aborted at chunk={chunk_count}.",
+                                    level="WARN",
+                                )
+                                eval_tok = chunk_count
+                                break
+
+                        if chunk_count % granularity == 0:
+                            elapsed = max(0.001, time.perf_counter() - req_start_t)
+                            live_tps = chunk_count / elapsed
+                            telemetry.update_role_tokens(role, est_input_tok + chunk_count, tps=live_tps)
+
+                            live_think, live_clean = extract_thinking_and_clean(
+                                "".join(acc_content), "".join(acc_thinking)
+                            )
+                            telemetry.raw_role = role_label
+                            telemetry.raw_model = model_name
+                            telemetry.raw_latency = elapsed
+                            telemetry.raw_tps = live_tps
+                            if live_think and live_clean:
+                                telemetry.raw_thought = f"[Thinking]\n{live_think[-1200:]}\n\n[Drafting]\n{live_clean[-600:]}"
+                            elif live_think:
+                                telemetry.raw_thought = f"[Thinking...]\n{live_think[-1800:]}"
+                            elif live_clean:
+                                telemetry.raw_thought = live_clean[-1800:]
+                            if telemetry.on_raw_update:
+                                await telemetry.on_raw_update()
+
+                    if data.get("done"):
+                        prompt_tok = int(data.get("prompt_eval_count") or 0)
+                        eval_tok = int(data.get("eval_count") or chunk_count)
+                        eval_duration_ns = int(data.get("eval_duration") or 0)
+                        break
+    except (TimeoutError, aiohttp.ClientError, OSError) as exc:
+        elapsed_err = time.perf_counter() - req_start_t
+        diag = await _diagnose_ollama_state()
+        diag.update({
+            "elapsed_sec": round(elapsed_err, 1),
+            "read_timeout_sec": read_timeout_sec,
+            "chunks_received": chunk_count,
+            "options": payload.get("options"),
+        })
+        if is_heavy:
+            error_logger.log_heavy_failure(
+                role, model_name, "CONNECTION_OR_TIMEOUT",
+                f"Connection/Timeout after {elapsed_err:.1f}s (chunks={chunk_count}): {type(exc).__name__}: {exc}",
+                diagnostics=diag,
+                exc=exc,
+            )
+        else:
+            error_logger.log_error(
+                "LLM_CLIENT",
+                f"[{role_label}] Network/Timeout error after {elapsed_err:.1f}s: {exc}",
+                exc=exc,
+                context=diag,
+            )
+        raise
 
     elapsed_req = max(0.001, time.perf_counter() - req_start_t)
     system_logger.log(
         "LLM_CLIENT",
-        f"[{role_label}] Stream done in {elapsed_req:.2f}s | prompt_tok={prompt_tok} | eval_tok={eval_tok} | tool_calls={len(acc_tool_calls)}",
+        f"[{role_label}] Done in {elapsed_req:.1f}s (in={prompt_tok}, out={eval_tok}, tools={len(acc_tool_calls)})",
     )
     assembled_msg: dict[str, Any] = {
         "role": "assistant",
@@ -311,14 +376,13 @@ async def _execute_ollama_stream(
 
     return assembled_msg, prompt_tok, eval_tok, eval_duration_ns, elapsed_req
 
+
 async def chat_step(
     role: str,
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], float, str, float]:
-    """
-    PM優先枠付きの並列制御と粒度可変ストリーミングで Ollama /api/chat を実行する。
-    """
+    """PM優先枠付きの並列制御と粒度可変ストリーミングで Ollama /api/chat を実行する"""
     model_name = get_model_for_role(role)
     prepared_msgs = _prepare_messages_for_ollama(messages)
     payload: dict[str, Any] = {
@@ -353,17 +417,13 @@ async def chat_step(
     is_pm = role.upper() == "PM"
 
     async def _run_locked() -> tuple[dict[str, Any], int, int, int, float]:
-        system_logger.log("LLM_CLIENT", f"[{role}] Waiting for total_sem...")
         async with total_sem:
-            system_logger.log("LLM_CLIENT", f"[{role}] Acquired total_sem. Executing stream...")
             return await _execute_ollama_stream(role, model_name, payload, est_input_tok)
 
     if is_pm:
         msg, prompt_tok, eval_tok, eval_duration_ns, elapsed_req = await _run_locked()
     else:
-        system_logger.log("LLM_CLIENT", f"[{role}] Waiting for bg_sem...")
         async with bg_sem:
-            system_logger.log("LLM_CLIENT", f"[{role}] Acquired bg_sem.")
             msg, prompt_tok, eval_tok, eval_duration_ns, elapsed_req = await _run_locked()
 
     if prompt_tok == 0:
@@ -384,16 +444,19 @@ async def chat_step(
     thinking_text, clean_content = extract_thinking_and_clean(raw_content, explicit_thinking)
 
     if not msg.get("tool_calls"):
-        fb_calls = extract_fallback_tool_calls(clean_content) or extract_fallback_tool_calls(raw_content)
+        fb_calls = (
+            extract_fallback_tool_calls(clean_content)
+            or extract_fallback_tool_calls(raw_content)
+            or extract_fallback_tool_calls(thinking_text)
+        )
         if fb_calls:
-            system_logger.log("LLM_CLIENT", f"[{role}] Extracted {len(fb_calls)} fallback tool call(s) from text.")
             msg["tool_calls"] = fb_calls
 
     msg["_clean_content"] = clean_content
     if thinking_text and clean_content:
-        msg["content"] = f"[Thinking]\n{thinking_text[:4000]}\n\n[Response]\n{clean_content}"
+        msg["content"] = f"[Thinking]\n{thinking_text[:1500]}\n\n[Response]\n{clean_content}"
     elif thinking_text:
-        msg["content"] = thinking_text[:4000]
+        msg["content"] = thinking_text[:1500]
     else:
         msg["content"] = clean_content
 
@@ -509,12 +572,15 @@ async def generate_heavy_brain(
 ) -> tuple[str, str, float, str, float]:
     """
     Stage 2 (Pure Brain): 重量モデル (Qwen3-Coder-Next) をツール無しで1回だけ呼び出し、
-    (thinking_text, clean_markdown, latency_sec, model_name, tps) を返す。
-    実行中は全並列枠 (PM用枠含むすべて) を完全ロックして他モデルの同時ロードによるOOMを防ぎ、
-    完了後は重量モデルを即座にアンロードしてロックを解放する。
+    失敗時は原因（モデル未pull、VRAM/RAM不足、タイムアウト等）を logs/error.log へ明示的に記録する。
     """
-    model_name = get_heavy_model_for_role(role)
-    light_model_name = get_model_for_role(role)
+    try:
+        model_name = get_heavy_model_for_role(role)
+        light_model_name = get_model_for_role(role)
+    except RuntimeError as exc:
+        error_logger.log_heavy_failure(role, "UNCONFIGURED", "CONFIG_LOAD", str(exc), exc=exc)
+        raise
+
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
@@ -563,10 +629,7 @@ async def generate_heavy_brain(
                     await total_sem.acquire()
                     acquired_total += 1
 
-                system_logger.log(
-                    "LLM_CLIENT",
-                    f"[{role}:HEAVY] All {total_slots} parallel slots locked exclusively. Preparing VRAM/RAM for {model_name}...",
-                )
+                system_logger.log("LLM_CLIENT", f"[{role}:HEAVY] Exclusive lock acquired. Unloading light models for {model_name}...")
                 await _unload_models_for_heavy(model_name)
                 try:
                     msg, prompt_tok, eval_tok, eval_duration_ns, elapsed_req = await _execute_ollama_stream(
@@ -598,19 +661,27 @@ async def generate_heavy_brain(
 
     telemetry.update_role_tokens(role, prompt_tok + eval_tok, tps=tps)
     thinking_text, clean_content = extract_thinking_and_clean(raw_content, explicit_thinking)
+
+    if not clean_content.strip():
+        error_logger.log_heavy_failure(
+            role, model_name, "EMPTY_OUTPUT",
+            "Heavy model returned empty content (only thinking or blank output).",
+            diagnostics={"thinking_len": len(thinking_text), "eval_tok": eval_tok},
+        )
+
     latency = time.perf_counter() - start_t
     return thinking_text, clean_content, latency, model_name, tps
 
 
 def extract_fallback_tool_calls(content: str) -> list[dict[str, Any]]:
-    """テキスト内に直接出力されたGemma4独自形式 (call:fn{...}) やJSON/タグ形式のツール呼び出しを抽出する"""
+    """テキスト内に直接出力されたGemma4独自形式 (call:fn{...}) や関数呼び出し形式のツール呼び出しを抽出する"""
     if not content:
         return []
 
     calls: list[dict[str, Any]] = []
 
-    # 1. Gemma4 ネイティブ構文: call:tool_name{key:"value", ...}
-    for m in re.finditer(r"call:([a-zA-Z0-9_]+)\s*\{", content):
+    # 1. Gemma4 ネイティブ構文: call:tool_name{...} または tool_name({...})
+    for m in re.finditer(r"(?:call:)?\b(invoke_heavy_brain|complete_phase|list_files|read_file|read_files|write_file|write_files|edit_lines|replace_in_file|search_files|run_command|web_search|fetch_url|export_zip)\s*\(?\s*\{", content):
         fn_name = m.group(1)
         brace_start = m.end() - 1
         depth = 0

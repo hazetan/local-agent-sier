@@ -184,18 +184,16 @@ async def _fetch_ollama_memory() -> dict[str, tuple[float, float]]:
         ):
             if resp.status == 200:
                 data = await resp.json()
-                models = data.get("models", [])
-                for m in models:
+                for m in data.get("models", []):
                     name = m.get("name", "")
                     total_gb = m.get("size", 0) / (1024**3)
                     vram_gb = m.get("size_vram", 0) / (1024**3)
                     ram_gb = max(0.0, total_gb - vram_gb)
                     result[name] = (vram_gb, ram_gb)
-                system_logger.log("TELEMETRY", f"Ollama /api/ps loaded models ({len(models)}): {result}")
             else:
-                system_logger.log("TELEMETRY", f"Ollama /api/ps returned HTTP {resp.status}", level="WARN")
+                system_logger.log("TELEMETRY", f"Ollama /api/ps HTTP {resp.status}", level="WARN")
     except (aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
-        system_logger.log("TELEMETRY", f"Ollama /api/ps fetch failed ({ps_url}): {exc}", level="WARN")
+        system_logger.log("TELEMETRY", f"Ollama /api/ps fetch failed: {exc}", level="WARN")
     return result
 
 
@@ -203,7 +201,6 @@ async def _fetch_desktop_hw_metrics() -> dict[str, float] | None:
     """Desktop側の desktop_metrics_server.py からリアルな VRAM / RAM 実測値を取得する"""
     url = get_desktop_metrics_url()
     if not url:
-        system_logger.log("TELEMETRY", "DESKTOP_METRICS_URL is not set in .env (using /api/ps & static config).")
         return None
     timeout = aiohttp.ClientTimeout(total=3)
     try:
@@ -212,12 +209,9 @@ async def _fetch_desktop_hw_metrics() -> dict[str, float] | None:
             session.get(url) as resp,
         ):
             if resp.status == 200:
-                data = await resp.json()
-                system_logger.log("TELEMETRY", f"Desktop HW metrics fetched: {data}")
-                return data
-            system_logger.log("TELEMETRY", f"Desktop HW metrics HTTP {resp.status} from {url}", level="WARN")
-    except (aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
-        system_logger.log("TELEMETRY", f"Desktop HW metrics fetch failed ({url}): {exc}", level="WARN")
+                return await resp.json()
+    except (aiohttp.ClientError, TimeoutError, OSError, ValueError):
+        pass
     return None
 
 def _format_tok_compact(tokens: int) -> str:

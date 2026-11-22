@@ -18,20 +18,14 @@ async def continuous_auditor_loop() -> None:
         await asyncio.sleep(get_auditor_interval_sec())
         try:
             if telemetry.active_roles:
-                system_logger.log(
-                    "AUDITOR",
-                    f"Skipped audit: Other role(s) currently active ({telemetry.active_role_label}).",
-                )
                 continue
 
             recent_logs = read_recent_logs(["PM", "SE", "PG", "QA"])
             if "(No logs recorded yet)" in recent_logs:
-                system_logger.log("AUDITOR", "Skipped audit: No logs recorded yet.")
                 continue
 
             digest = hashlib.sha256(recent_logs.encode("utf-8", errors="replace")).hexdigest()
             if digest == last_digest:
-                system_logger.log("AUDITOR", "Skipped audit: No changes in logs since last audit.")
                 continue
 
             system_logger.log("AUDITOR", "Log changes detected. Running AUDITOR phase...")
@@ -42,9 +36,7 @@ async def continuous_auditor_loop() -> None:
             )
             await run_role_phase("AUDITOR", instruction, max_steps=5)
             last_digest = digest
-            system_logger.log("AUDITOR", "AUDITOR phase finished.")
         except asyncio.CancelledError:
-            system_logger.log("AUDITOR", "continuous_auditor_loop cancelled.")
             raise
         except (RuntimeError, aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
             print(f"[Auditor Error] {exc}")

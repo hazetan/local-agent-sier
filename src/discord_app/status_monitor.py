@@ -11,7 +11,8 @@ from core.config import (
 from core.logger import system_logger
 from core.telemetry import render_raw_log_box, render_status_box, telemetry
 
-RAW_LOG_MIN_INTERVAL_SEC = 5.0
+STATUS_MIN_INTERVAL_SEC = 6.5
+RAW_LOG_MIN_INTERVAL_SEC = 6.5
 
 
 def _strip_timestamp(box_text: str) -> str:
@@ -29,7 +30,9 @@ class LiveStatusMonitor:
         self.client = client
         self.status_message: discord.Message | None = None
         self.raw_log_message: discord.Message | None = None
+        self._last_status_edit_t: float = 0.0
         self._last_raw_edit_t: float = 0.0
+        self._pending_status_task: asyncio.Task[None] | None = None
         self._pending_raw_task: asyncio.Task[None] | None = None
         self._status_lock = asyncio.Lock()
         self._raw_lock = asyncio.Lock()
@@ -67,11 +70,11 @@ class LiveStatusMonitor:
 
     async def initialize_box(self) -> None:
         """起動時にステータスBoxと生ログBoxの両方を初期化する"""
-        system_logger.log("STATUS_MON", f"Initializing boxes (status_ch={get_status_channel_id()}, raw_ch={get_raw_log_channel_id()})...")
         async with self._status_lock:
             status_content = await render_status_box()
             self.status_message = await self._purge_and_send(get_status_channel_id(), status_content)
             self._last_status_body = _strip_timestamp(status_content)
+            self._last_status_edit_t = time.monotonic()
 
         async with self._raw_lock:
             raw_content = render_raw_log_box()
@@ -81,40 +84,62 @@ class LiveStatusMonitor:
 
         system_logger.log(
             "STATUS_MON",
-            f"Boxes initialized (status_msg={bool(self.status_message)}, raw_msg={bool(self.raw_log_message)}).",
+            f"Boxes initialized (status={bool(self.status_message)}, raw={bool(self.raw_log_message)}).",
         )
 
+    async def _delayed_status_refresh(self, delay: float) -> None:
+        await asyncio.sleep(delay)
+        self._pending_status_task = None
+        await self.refresh_box()
+
     async def refresh_box(self) -> None:
-        """稼働状況Boxを上書き更新する（多重実行防止＆差分なし時はスキップ）"""
-        if not get_status_channel_id() or self._status_lock.locked():
+        """稼働状況Boxをクールダウン付きで安全に上書き更新する（429防止）"""
+        if not get_status_channel_id():
             return
+
+        if self._status_lock.locked():
+            if not self._pending_status_task or self._pending_status_task.done():
+                self._pending_status_task = asyncio.create_task(
+                    self._delayed_status_refresh(STATUS_MIN_INTERVAL_SEC)
+                )
+            return
+
+        now = time.monotonic()
+        elapsed = now - self._last_status_edit_t
+        if elapsed < STATUS_MIN_INTERVAL_SEC:
+            if not self._pending_status_task or self._pending_status_task.done():
+                wait_sec = STATUS_MIN_INTERVAL_SEC - elapsed + 0.2
+                self._pending_status_task = asyncio.create_task(self._delayed_status_refresh(wait_sec))
+            return
+
         async with self._status_lock:
             content = await render_status_box()
             body = _strip_timestamp(content)
             if not self.status_message:
                 self.status_message = await self._purge_and_send(get_status_channel_id(), content)
                 self._last_status_body = body
+                self._last_status_edit_t = time.monotonic()
                 return
             if body == self._last_status_body:
                 return
             try:
                 await self.status_message.edit(content=content)
                 self._last_status_body = body
-                system_logger.log("STATUS_MON", "Status box refreshed successfully.")
             except discord.NotFound:
                 self.status_message = None
                 self._last_status_body = ""
             except (discord.DiscordException, OSError) as exc:
-                print(f"[StatusMonitor] Status refresh error: {exc}")
                 system_logger.error("STATUS_MON", f"Status refresh error: {exc}", exc)
+            finally:
+                self._last_status_edit_t = time.monotonic()
 
     async def _delayed_raw_refresh(self, delay: float) -> None:
         await asyncio.sleep(delay)
         self._pending_raw_task = None
         await self.refresh_raw_log_box()
-    
+
     async def refresh_raw_log_box(self) -> None:
-        """log-raw チャンネルの生ログBoxを排他ロック＆完了後5秒間隔で安全に更新する"""
+        """log-raw チャンネルの生ログBoxを排他ロック＆6.5秒間隔で安全に更新する"""
         if not get_raw_log_channel_id():
             return
 
@@ -129,7 +154,7 @@ class LiveStatusMonitor:
         elapsed = now - self._last_raw_edit_t
         if elapsed < RAW_LOG_MIN_INTERVAL_SEC:
             if not self._pending_raw_task or self._pending_raw_task.done():
-                wait_sec = RAW_LOG_MIN_INTERVAL_SEC - elapsed + 0.1
+                wait_sec = RAW_LOG_MIN_INTERVAL_SEC - elapsed + 0.2
                 self._pending_raw_task = asyncio.create_task(self._delayed_raw_refresh(wait_sec))
             return
 
@@ -152,14 +177,16 @@ class LiveStatusMonitor:
                 self.raw_log_message = None
                 self._last_raw_body = ""
             except (discord.DiscordException, OSError) as exc:
-                print(f"[StatusMonitor] Raw log refresh error: {exc}")
+                system_logger.error("STATUS_MON", f"Raw log refresh error: {exc}", exc)
             finally:
                 self._last_raw_edit_t = time.monotonic()
 
     async def remove_box(self) -> None:
         """Bot停止時に保留タスクをキャンセルし両方のBoxを削除する"""
-        if self._pending_raw_task and not self._pending_raw_task.done():
-            self._pending_raw_task.cancel()
+        for task in (self._pending_status_task, self._pending_raw_task):
+            if task and not task.done():
+                task.cancel()
+        self._pending_status_task = None
         self._pending_raw_task = None
 
         for msg in (self.status_message, self.raw_log_message):
@@ -174,7 +201,5 @@ class LiveStatusMonitor:
     async def periodic_update_loop(self) -> None:
         await self.initialize_box()
         while True:
-            await asyncio.sleep(get_status_update_interval_sec())
+            await asyncio.sleep(max(STATUS_MIN_INTERVAL_SEC, get_status_update_interval_sec()))
             await self.refresh_box()
-    
-    

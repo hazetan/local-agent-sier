@@ -80,6 +80,7 @@ async def _execute_autonomous_initiative(on_phase_complete: StatusCallback | Non
             "SE",
             AUTONOMOUS_INITIATIVE_PROMPT,
             max_steps=get_autonomous_max_steps(),
+            require_heavy=False,
         )
     except (RuntimeError, aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
         err_detail = f"{type(exc).__name__}: {exc}"
