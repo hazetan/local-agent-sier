@@ -1,6 +1,8 @@
 import asyncio
 import hashlib
 
+import aiohttp
+
 from core.config import get_auditor_interval_sec
 from core.logger import read_recent_logs, system_logger
 from core.telemetry import telemetry
@@ -44,6 +46,6 @@ async def continuous_auditor_loop() -> None:
         except asyncio.CancelledError:
             system_logger.log("AUDITOR", "continuous_auditor_loop cancelled.")
             raise
-        except Exception as exc:
+        except (RuntimeError, aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
             print(f"[Auditor Error] {exc}")
             system_logger.error("AUDITOR", f"Auditor loop error: {exc}", exc)

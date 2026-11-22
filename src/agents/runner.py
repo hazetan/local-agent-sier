@@ -1,6 +1,8 @@
 import asyncio
 from typing import Any
 
+import aiohttp
+
 from core.config import (
     get_max_ctx_chars_budget,
     get_max_steps_per_phase,
@@ -130,7 +132,7 @@ async def run_role_phase(
                 if not header_logged:
                     logger.log_phase_start(model_name, instruction[:200])
                     header_logged = True
-            except Exception as exc:
+            except (RuntimeError, aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
                 logger.log_error(str(exc))
                 system_logger.error("RUNNER", f"[{role}] Step {step} chat_step failed: {exc}", exc)
                 raise
@@ -289,7 +291,7 @@ async def _execute_heavy_brain_stage(
         thinking_text, clean_md, h_latency, h_model, h_tps = await generate_heavy_brain(
             role, heavy_sys_prompt, heavy_user_prompt
         )
-    except Exception as exc:
+    except (RuntimeError, aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
         err_msg = f"Error in invoke_heavy_brain ({type(exc).__name__}): {exc}"
         logger.log_error(err_msg)
         system_logger.error("RUNNER", f"[{role}:HEAVY] Failed: {err_msg}", exc)

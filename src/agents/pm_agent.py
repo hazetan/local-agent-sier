@@ -1,6 +1,8 @@
 import asyncio
 from pathlib import Path
 
+import aiohttp
+
 from core.logger import system_logger
 
 from .runner import run_role_phase
@@ -23,7 +25,7 @@ async def handle_client_message(user_message: str) -> tuple[str, list[Path]]:
         )
         try:
             summary, zip_strs = await run_role_phase("PM", instruction, max_steps=10)
-        except Exception as exc:
+        except (RuntimeError, aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
             system_logger.error("PM_AGENT", f"PM phase failed: {exc}", exc)
             return f"推論エラーが発生しました (PM): {exc}", []
 

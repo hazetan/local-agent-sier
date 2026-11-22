@@ -66,16 +66,15 @@ def _parse_json_lenient(raw: str) -> Any | None:
     ):
         try:
             return json.loads(candidate)
-        except Exception:
+        except json.JSONDecodeError:
             pass
     try:
         val = ast.literal_eval(s)
         if isinstance(val, (dict, list)):
             return val
-    except Exception:
+    except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
         pass
     return None
-
 
 def extract_thinking_and_clean(raw_content: str, explicit_thinking: str = "") -> tuple[str, str]:
     """
@@ -235,7 +234,7 @@ async def _execute_ollama_stream(
                     continue
                 try:
                     data = json.loads(line)
-                except Exception:
+                except json.JSONDecodeError:
                     continue
 
                 if "error" in data:
@@ -410,7 +409,7 @@ async def warmup_models() -> None:
             m = get_model_for_role(role)
             if m and m not in models:
                 models.append(m)
-        except Exception:
+        except RuntimeError:
             continue
 
     if not models:
@@ -449,7 +448,7 @@ async def warmup_models() -> None:
                             f"[WARMUP] Failed to preload model={model_name} (HTTP {resp.status}): {body[:200]}",
                             level="WARN",
                         )
-        except Exception as exc:
+        except (TimeoutError, aiohttp.ClientError, OSError) as exc:
             system_logger.error("LLM_CLIENT", f"[WARMUP] Exception while preloading {model_name}: {exc}", exc)
 
 
@@ -466,7 +465,7 @@ async def _unload_models_for_heavy(keep_model_name: str) -> None:
                 m = getter(r)
                 if m and m != keep_model_name and m not in models_to_unload:
                     models_to_unload.append(m)
-            except Exception:
+            except RuntimeError:
                 continue
 
     chat_url = get_ollama_chat_url()
@@ -483,7 +482,7 @@ async def _unload_models_for_heavy(keep_model_name: str) -> None:
                             loaded_name = m_info.get(key)
                             if loaded_name and loaded_name != keep_model_name and loaded_name not in models_to_unload:
                                 models_to_unload.append(loaded_name)
-        except Exception:
+        except (TimeoutError, aiohttp.ClientError, json.JSONDecodeError, OSError):
             pass
 
         for m in models_to_unload:
@@ -494,7 +493,7 @@ async def _unload_models_for_heavy(keep_model_name: str) -> None:
                     json={"model": m, "messages": [], "stream": False, "keep_alive": 0},
                 ) as resp:
                     await resp.read()
-            except Exception as exc:
+            except (TimeoutError, aiohttp.ClientError, OSError) as exc:
                 system_logger.log("LLM_CLIENT", f"[HEAVY_PREP] Unload warning for '{m}': {exc}", level="WARN")
 
 

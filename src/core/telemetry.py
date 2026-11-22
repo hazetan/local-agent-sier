@@ -167,7 +167,7 @@ def _get_rpi_free_ram_gb() -> float:
                 if line.startswith("MemAvailable:"):
                     kb = int(line.split()[1])
                     return kb / (1024 * 1024)
-    except Exception:
+    except (OSError, ValueError, IndexError):
         pass
     return 0.0
 
@@ -192,7 +192,7 @@ async def _fetch_ollama_memory() -> dict[str, tuple[float, float]]:
                     system_logger.log("TELEMETRY", f"Ollama /api/ps loaded models ({len(models)}): {result}")
                 else:
                     system_logger.log("TELEMETRY", f"Ollama /api/ps returned HTTP {resp.status}", level="WARN")
-    except Exception as exc:
+    except (aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
         system_logger.log("TELEMETRY", f"Ollama /api/ps fetch failed ({ps_url}): {exc}", level="WARN")
     return result
 
@@ -212,7 +212,7 @@ async def _fetch_desktop_hw_metrics() -> dict[str, float] | None:
                     system_logger.log("TELEMETRY", f"Desktop HW metrics fetched: {data}")
                     return data
                 system_logger.log("TELEMETRY", f"Desktop HW metrics HTTP {resp.status} from {url}", level="WARN")
-    except Exception as exc:
+    except (aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
         system_logger.log("TELEMETRY", f"Desktop HW metrics fetch failed ({url}): {exc}", level="WARN")
     return None
 
@@ -329,7 +329,7 @@ async def render_status_box() -> str:
         is_heavy = role in telemetry.heavy_active_roles
         try:
             model = get_heavy_model_for_role(role) if is_heavy else get_model_for_role(role)
-        except Exception:
+        except RuntimeError:
             model = "none"
 
         role_max_ctx = heavy_ctx if is_heavy else light_ctx

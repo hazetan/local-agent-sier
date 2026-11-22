@@ -44,7 +44,7 @@ class LiveStatusMonitor:
         if not ch:
             try:
                 ch = await self.client.fetch_channel(ch_id)
-            except Exception:
+            except (discord.DiscordException, OSError):
                 return None
         return ch if isinstance(ch, discord.TextChannel) else None
 
@@ -56,12 +56,12 @@ class LiveStatusMonitor:
             async for msg in channel.history(limit=15):
                 if self.client.user and msg.author.id == self.client.user.id:
                     await msg.delete()
-        except Exception:
+        except (discord.DiscordException, OSError):
             pass
 
         try:
             return await channel.send(content)
-        except Exception as exc:
+        except (discord.DiscordException, OSError) as exc:
             print(f"[StatusMonitor] Send error in channel {ch_id}: {exc}")
             return None
 
@@ -104,7 +104,7 @@ class LiveStatusMonitor:
             except discord.NotFound:
                 self.status_message = None
                 self._last_status_body = ""
-            except Exception as exc:
+            except (discord.DiscordException, OSError) as exc:
                 print(f"[StatusMonitor] Status refresh error: {exc}")
                 system_logger.error("STATUS_MON", f"Status refresh error: {exc}", exc)
 
@@ -154,7 +154,7 @@ class LiveStatusMonitor:
             except discord.NotFound:
                 self.raw_log_message = None
                 self._last_raw_body = ""
-            except Exception as exc:
+            except (discord.DiscordException, OSError) as exc:
                 print(f"[StatusMonitor] Raw log refresh error: {exc}")
             finally:
                 self._last_raw_edit_t = time.monotonic()
@@ -169,7 +169,7 @@ class LiveStatusMonitor:
             if msg:
                 try:
                     await msg.delete()
-                except Exception:
+                except (discord.DiscordException, OSError):
                     pass
         self.status_message = None
         self.raw_log_message = None

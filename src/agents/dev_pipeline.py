@@ -4,6 +4,9 @@ import time
 from collections.abc import Callable, Coroutine
 from typing import Any
 
+import aiohttp
+import discord
+
 from core.config import (
     get_autonomous_enable,
     get_autonomous_idle_sec,
@@ -52,7 +55,7 @@ async def _execute_single_role(role: str, on_phase_complete: StatusCallback | No
     )
     try:
         summary, _ = await run_role_phase(role, instruction)
-    except Exception as exc:
+    except (RuntimeError, aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
         err_detail = f"{type(exc).__name__}: {exc}"
         print(f"[DevPipeline Error ({role})] {err_detail}")
         system_logger.error("DEV_PIPELINE", f"Worker error in role={role}: {err_detail}", exc)
@@ -78,7 +81,7 @@ async def _execute_autonomous_initiative(on_phase_complete: StatusCallback | Non
             AUTONOMOUS_INITIATIVE_PROMPT,
             max_steps=get_autonomous_max_steps(),
         )
-    except Exception as exc:
+    except (RuntimeError, aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
         err_detail = f"{type(exc).__name__}: {exc}"
         print(f"[DevPipeline Error (AUTONOMOUS)] {err_detail}")
         system_logger.error("DEV_PIPELINE", f"Autonomous worker error: {err_detail}", exc)
@@ -91,6 +94,7 @@ async def _execute_autonomous_initiative(on_phase_complete: StatusCallback | Non
             await on_phase_complete(f"**[自律行動・整理整頓＆自己タスク起票 完了報告]**\n{summary}")
     else:
         system_logger.log("DEV_PIPELINE", "Autonomous worker finished without complete_phase.", level="WARN")
+
 
 
 async def continuous_dev_pipeline_loop(on_phase_complete: StatusCallback | None = None) -> None:
@@ -118,7 +122,7 @@ async def continuous_dev_pipeline_loop(on_phase_complete: StatusCallback | None 
                             task.result()
                         except asyncio.CancelledError:
                             raise
-                        except Exception as exc:
+                        except (RuntimeError, aiohttp.ClientError, discord.DiscordException, TimeoutError, OSError, ValueError) as exc:
                             err_detail = f"{type(exc).__name__}: {exc}"
                             print(f"[DevPipeline Error ({role})] {err_detail}")
                             system_logger.error("DEV_PIPELINE", f"Task result error ({role}): {err_detail}", exc)
@@ -128,7 +132,6 @@ async def continuous_dev_pipeline_loop(on_phase_complete: StatusCallback | None 
                     system_logger.log("DEV_PIPELINE", f"Detected pending roles in ~/TASK.md: {pending_roles}")
                     last_pending = list(pending_roles)
 
-                # 品質とVRAM/RAM効率を最優先するため、開発ラインは最優先の1部署のみを排他実行する
                 if not running_tasks and pending_roles:
                     next_role = pending_roles[0]
                     system_logger.log("DEV_PIPELINE", f"Spawning exclusive worker task for role={next_role}")
@@ -162,7 +165,7 @@ async def continuous_dev_pipeline_loop(on_phase_complete: StatusCallback | None 
             except asyncio.CancelledError:
                 system_logger.log("DEV_PIPELINE", "continuous_dev_pipeline_loop cancelled.")
                 raise
-            except Exception as exc:
+            except (RuntimeError, aiohttp.ClientError, discord.DiscordException, TimeoutError, OSError, ValueError) as exc:
                 err_detail = f"{type(exc).__name__}: {exc}"
                 print(f"[DevPipeline Loop Error] {err_detail}")
                 system_logger.error("DEV_PIPELINE", f"Loop error: {err_detail}", exc)

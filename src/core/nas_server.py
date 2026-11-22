@@ -38,7 +38,7 @@ def get_local_ip() -> str:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("8.8.8.8", 80))
             return s.getsockname()[0]
-    except Exception:
+    except OSError:
         return "127.0.0.1"
 
 
@@ -141,7 +141,7 @@ async def basic_auth_middleware(request: web.Request, handler):
             user, pw = decoded.split(":", 1)
             if user == expected_user and pw == expected_pass:
                 return await handler(request)
-        except Exception:
+        except (ValueError, UnicodeDecodeError):
             pass
 
     return web.Response(

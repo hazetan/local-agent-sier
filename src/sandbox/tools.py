@@ -63,7 +63,7 @@ def _is_readable_text_file(path: Path, allowed_exts: set[str] | None = None) -> 
             chunk = f.read(512)
             if b"\x00" in chunk:
                 return False
-    except Exception:
+    except OSError:
         return False
     return True
 
@@ -232,7 +232,7 @@ def _tool_edit_lines(args: dict[str, Any]) -> str:
         try:
             s_line = int(item["start_line"])
             e_line = int(item.get("end_line", s_line))
-        except Exception:
+        except (KeyError, ValueError, TypeError):
             errors.append(f"Edit #{idx} ({raw_path}): 'start_line'/'end_line' must be integers.")
             continue
 
@@ -254,10 +254,8 @@ def _tool_edit_lines(args: dict[str, Any]) -> str:
         lines = orig_text.splitlines()
         total = len(lines)
 
-        # 下の行（start_lineの降順）からソート
         ops_sorted = sorted(ops, key=lambda x: (x[0], x[1]), reverse=True)
 
-        # 範囲妥当性＆重複チェック
         file_err = False
         for i, (s_line, e_line, _) in enumerate(ops_sorted):
             if s_line > total + 1 or e_line > max(total, s_line):
@@ -275,7 +273,6 @@ def _tool_edit_lines(args: dict[str, Any]) -> str:
         if file_err:
             continue
 
-        # 降順で置換適用
         for s_line, e_line, new_text in ops_sorted:
             replacement_lines = new_text.splitlines() if new_text != "" else []
             lines[s_line - 1 : e_line] = replacement_lines
@@ -283,7 +280,6 @@ def _tool_edit_lines(args: dict[str, Any]) -> str:
         new_full_text = "\n".join(lines) + ("\n" if lines else "")
         target.write_text(new_full_text, encoding="utf-8")
 
-        # 編集後のプレビュー（最初の編集箇所の周辺）を生成
         min_s = min(op[0] for op in ops_sorted)
         max_e = max(op[1] for op in ops_sorted)
         preview_start = max(1, min_s - 2)
@@ -359,7 +355,7 @@ def _tool_search_files(args: dict[str, Any]) -> str:
                             if len(hit_lines) >= 30:
                                 hit_lines.append("  ...(more matches in this file)...")
                                 break
-            except Exception:
+            except OSError:
                 continue
             if hit_lines:
                 rel = fpath.relative_to(ws)
@@ -381,6 +377,8 @@ def _tool_run_command(args: dict[str, Any]) -> str:
 
 
 def _tool_web_search(args: dict[str, Any]) -> str:
+    from ddgs.exceptions import DDGSException
+
     query = str(args.get("query", "")).strip()
     if not query:
         return "Error: Empty query."
@@ -393,7 +391,7 @@ def _tool_web_search(args: dict[str, Any]) -> str:
             f"{i}. {r.get('title')}\n   {r.get('body')}\n   URL: {r.get('href')}"
             for i, r in enumerate(results, 1)
         )
-    except Exception as exc:
+    except (DDGSException, OSError, TimeoutError, ValueError, RuntimeError) as exc:
         return f"Search error: {exc}"
 
 
@@ -403,10 +401,10 @@ def _tool_fetch_url(args: dict[str, Any]) -> str:
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             html = resp.read().decode("utf-8", errors="replace")
-        text = re.sub(r"<(script|style).*?>.*?</\1>", "", html, flags=re.DOTALL | re.I)
+        text = re.sub(r"<(script|style).*?>.*?</\1>", "", html, flags=re.DOTALL | re.IGNORECASE)
         text = " ".join(re.sub(r"<[^>]+>", " ", text).split())
         return text[:4000]
-    except Exception as exc:
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
         return f"Fetch error: {exc}"
 
 
@@ -532,7 +530,7 @@ def parse_tool_args(raw_args: Any) -> dict[str, Any]:
     if isinstance(raw_args, str):
         try:
             return json.loads(raw_args)
-        except Exception:
+        except json.JSONDecodeError:
             return {}
     return {}
 

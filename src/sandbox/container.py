@@ -152,12 +152,12 @@ def run_in_sandbox(command: str) -> str:
             for offset in range(0, len(script_bytes), chunk_size):
                 proc.stdin.write(view[offset : offset + chunk_size])
                 proc.stdin.flush()
-        except Exception:
+        except (BrokenPipeError, OSError, ValueError):
             pass
         finally:
             try:
                 proc.stdin.close()
-            except Exception:
+            except (BrokenPipeError, OSError, ValueError):
                 pass
 
     feeder = threading.Thread(target=_feed_stdin, daemon=True)
