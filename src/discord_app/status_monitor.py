@@ -109,12 +109,9 @@ class LiveStatusMonitor:
                 system_logger.error("STATUS_MON", f"Status refresh error: {exc}", exc)
 
     async def _delayed_raw_refresh(self, delay: float) -> None:
-        try:
-            await asyncio.sleep(delay)
-            self._pending_raw_task = None
-            await self.refresh_raw_log_box()
-        except asyncio.CancelledError:
-            raise
+        await asyncio.sleep(delay)
+        self._pending_raw_task = None
+        await self.refresh_raw_log_box()
     
     async def refresh_raw_log_box(self) -> None:
         """log-raw チャンネルの生ログBoxを排他ロック＆完了後5秒間隔で安全に更新する"""

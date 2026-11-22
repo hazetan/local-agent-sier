@@ -144,9 +144,9 @@ def _prepare_messages_for_ollama(messages: list[dict[str, Any]]) -> list[dict[st
             if "tool_call_id" in m:
                 msg_copy["tool_call_id"] = m["tool_call_id"]
 
-        if "tool_calls" in m and m["tool_calls"]:
+        if tool_calls := m.get("tool_calls"):
             norm_calls = []
-            for tc in m["tool_calls"]:
+            for tc in tool_calls:
                 fn = dict(tc.get("function", {}))
                 raw_args = fn.get("arguments", {})
                 if isinstance(raw_args, str):
@@ -437,17 +437,19 @@ async def warmup_models() -> None:
             f"[WARMUP] Preloading model={model_name} into VRAM/RAM (options={options}, keep_alive={keep_alive})...",
         )
         try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(chat_url, json=payload) as resp:
-                    body = await resp.text()
-                    if resp.status == 200:
-                        system_logger.log("LLM_CLIENT", f"[WARMUP] Model={model_name} preloaded successfully.")
-                    else:
-                        system_logger.log(
-                            "LLM_CLIENT",
-                            f"[WARMUP] Failed to preload model={model_name} (HTTP {resp.status}): {body[:200]}",
-                            level="WARN",
-                        )
+            async with (
+                aiohttp.ClientSession(timeout=timeout) as session,
+                session.post(chat_url, json=payload) as resp,
+            ):
+                body = await resp.text()
+                if resp.status == 200:
+                    system_logger.log("LLM_CLIENT", f"[WARMUP] Model={model_name} preloaded successfully.")
+                else:
+                    system_logger.log(
+                        "LLM_CLIENT",
+                        f"[WARMUP] Failed to preload model={model_name} (HTTP {resp.status}): {body[:200]}",
+                        level="WARN",
+                    )
         except (TimeoutError, aiohttp.ClientError, OSError) as exc:
             system_logger.error("LLM_CLIENT", f"[WARMUP] Exception while preloading {model_name}: {exc}", exc)
 

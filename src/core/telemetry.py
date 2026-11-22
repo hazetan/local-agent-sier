@@ -178,20 +178,22 @@ async def _fetch_ollama_memory() -> dict[str, tuple[float, float]]:
     ps_url = get_ollama_ps_url()
     timeout = aiohttp.ClientTimeout(total=5)
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(ps_url) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    models = data.get("models", [])
-                    for m in models:
-                        name = m.get("name", "")
-                        total_gb = m.get("size", 0) / (1024**3)
-                        vram_gb = m.get("size_vram", 0) / (1024**3)
-                        ram_gb = max(0.0, total_gb - vram_gb)
-                        result[name] = (vram_gb, ram_gb)
-                    system_logger.log("TELEMETRY", f"Ollama /api/ps loaded models ({len(models)}): {result}")
-                else:
-                    system_logger.log("TELEMETRY", f"Ollama /api/ps returned HTTP {resp.status}", level="WARN")
+        async with (
+            aiohttp.ClientSession(timeout=timeout) as session,
+            session.get(ps_url) as resp,
+        ):
+            if resp.status == 200:
+                data = await resp.json()
+                models = data.get("models", [])
+                for m in models:
+                    name = m.get("name", "")
+                    total_gb = m.get("size", 0) / (1024**3)
+                    vram_gb = m.get("size_vram", 0) / (1024**3)
+                    ram_gb = max(0.0, total_gb - vram_gb)
+                    result[name] = (vram_gb, ram_gb)
+                system_logger.log("TELEMETRY", f"Ollama /api/ps loaded models ({len(models)}): {result}")
+            else:
+                system_logger.log("TELEMETRY", f"Ollama /api/ps returned HTTP {resp.status}", level="WARN")
     except (aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
         system_logger.log("TELEMETRY", f"Ollama /api/ps fetch failed ({ps_url}): {exc}", level="WARN")
     return result
@@ -205,13 +207,15 @@ async def _fetch_desktop_hw_metrics() -> dict[str, float] | None:
         return None
     timeout = aiohttp.ClientTimeout(total=3)
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    system_logger.log("TELEMETRY", f"Desktop HW metrics fetched: {data}")
-                    return data
-                system_logger.log("TELEMETRY", f"Desktop HW metrics HTTP {resp.status} from {url}", level="WARN")
+        async with (
+            aiohttp.ClientSession(timeout=timeout) as session,
+            session.get(url) as resp,
+        ):
+            if resp.status == 200:
+                data = await resp.json()
+                system_logger.log("TELEMETRY", f"Desktop HW metrics fetched: {data}")
+                return data
+            system_logger.log("TELEMETRY", f"Desktop HW metrics HTTP {resp.status} from {url}", level="WARN")
     except (aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
         system_logger.log("TELEMETRY", f"Desktop HW metrics fetch failed ({url}): {exc}", level="WARN")
     return None
@@ -224,7 +228,7 @@ def _format_tok_compact(tokens: int) -> str:
 
 def _make_bar(ratio: float, width: int = 10) -> str:
     clamped = max(0.0, min(1.0, ratio))
-    filled = int(round(clamped * width))
+    filled = round(clamped * width)
     return "█" * filled + "░" * (width - filled)
 
 
