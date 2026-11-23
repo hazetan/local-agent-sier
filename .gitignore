@@ -1,11 +1,35 @@
-# Custom
-log/
-.venv
-.database
-workspace
-run
+# SIer Agent Runtime Directories
+workspace/
+exports/
+logs/
+*.log
+*.zip
+
+# Environment Variables
+.env
+.env.*
+!.env.example
+
+# Dockerfile
 Dockerfile.sandbox
 
+# Python & Linter Caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
