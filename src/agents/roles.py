@@ -253,34 +253,34 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             },
         },
     },
-    "invoke_heavy_brain": {
+    "invoke_professional": {
         "type": "function",
         "function": {
-            "name": "invoke_heavy_brain",
+            "name": "invoke_professional",
             "description": (
-                "【SE/PG専用・メイン執筆ツール】指定した context_paths の既存ファイルをPython側で自動収集し、"
-                "30GBクラスの重量級モデル (MODEL_HEAVY) に設計書や生コード全文を一括執筆させ、"
-                "出力された全ファイル ('### FILE: ~/path' ブロック) をPythonが0秒でワークスペースへ自動保存します。"
+                "【子タスク外注ツール】大規模な設計・新規実装や、難解なバグ・コンパイルエラー・テスト失敗に直面した際、"
+                "明確な子タスク (subtask_title) と達成条件 (instruction) を定義してプロフェッショナル (Qwen3-Coder-Next) に作業を外注します。"
+                "呼び出された Professional はあなたと同じ全ツール（ファイル読み書き・行編集・コマンド実行）を駆使し、"
+                "最大512ステップまで自律的に実装・ビルド・テスト検証を行って子タスクを完遂してから結果を返します。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "context_paths": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "重量モデルに参照させる既存ファイルやディレクトリのパス一覧 (例: ['~/src', '~/DESIGN.md'])",
+                    "subtask_title": {
+                        "type": "string",
+                        "description": "外注する子タスクの明確なタイトル (例: 'SafetyManagerとBlackboxの実装および単体テスト通過')",
+                    },
+                    "instruction": {
+                        "type": "string",
+                        "description": "Professionalに対する具体的な仕様・修正対象・達成すべき完了条件（ビルド・テスト通過条件など）",
                     },
                     "target_files": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "重量モデルに新規作成または全面更新させる対象ファイルパス一覧 (例: ['~/app/main.py'])",
-                    },
-                    "instruction": {
-                        "type": "string",
-                        "description": "重量モデルに対する具体的な設計・実装指示（要件、仕様、修正ポイントなど）",
+                        "description": "（任意）主に関与・作成・修正してほしい対象ファイルパスのリスト",
                     },
                 },
-                "required": ["target_files", "instruction"],
+                "required": ["subtask_title", "instruction"],
             },
         },
     },
@@ -311,26 +311,29 @@ ROLE_PROMPTS: dict[str, str] = {
         "4. 最後に `complete_phase` を呼び出し、`summary` に顧客への丁寧で簡潔な日本語の応答メッセージを入れて完了してください。"
     ),
     "SE": (
-        "あなたは日本の最高峰ミッションクリティカルSIerの【SE（オペレーター / 斥候＆アーキテクチャ進行管理）】です。\n"
+        "あなたは日本の最高峰ミッションクリティカルSIerの【SE（アーキテクト＆進行管理）】です。\n"
         "作業空間のルートは常に `~/` です。設計書の単一真実源（SSOT）は常にルート直下の `~/DESIGN.md` ただ1つです。\n"
-        "【3ステージ実行ルール（厳守）】\n"
-        "1. [Stage 1: 斥候] `list_files` や `search_files` で最小限のステップでディレクトリ構造を把握してください。\n"
-        "2. [Stage 2: 重量級設計] あなた自身が直接設計書を書いてはいけません。必ず `invoke_heavy_brain` を呼び出し、`context_paths` と `target_files=['~/DESIGN.md']` を指定して、重量級モデルに数理モデル・バイナリ構造・不変条件・極限テスト仕様まで網羅した `~/DESIGN.md` を一発執筆＆自動配置させてください。\n"
-        "3. [Stage 3: 台帳同期＆ステータス更新] `~/README.md` のディレクトリ台帳と `~/DESIGN.md` のパス定義が完全一致していることを確認し、`edit_lines` 等で `~/TASK.md` の該当タスクを `[TODO]` から `[IMPL]` に書き換えてから `complete_phase` を呼び出してください。"
+        f"{BATCH_EFFICIENCY_NOTE}\n"
+        "【職務と自律判断ルール（自力遂行 or 外注）】\n"
+        "1. `list_files` や `read_files` で現状を把握し、`~/TASK.md` の `[TODO]` タスクに対する基本設計・詳細設計を `~/DESIGN.md` に策定してください。\n"
+        "2. 【自力で頑張るか外注するかの裁量】\n"
+        "   - 小〜中規模の設計更新やディレクトリ整理であれば、あなた自身が `write_file` / `edit_lines` / `add_lines_after` を使って直接 `~/DESIGN.md` を執筆して構いません。\n"
+        "   - 高度な数理モデル・複雑なバイナリ仕様・大規模アーキテクチャ設計が必要な場合は、子タスクを定義して `invoke_professional` を呼び出し、チーフプロフェッショナル（Qwen3-Coder-Next）に設計書の作成・検証を外注することができます。\n"
+        "3. `~/README.md` のディレクトリ台帳と `~/DESIGN.md` のパス定義が完全一致していることを確認し、`~/TASK.md` の該当タスクを `[TODO]` から `[IMPL]` に書き換えてから `complete_phase` を呼び出してください。"
     ),
     "PG": (
-        "あなたは日本の最高峰ミッションクリティカルSIerの【PG（オペレーター / 実装配置・極限ビルド検証担当）】です。\n"
+        "あなたは日本の最高峰ミッションクリティカルSIerの【PG（実装＆極限ビルド検証担当）】です。\n"
         "作業空間のルートは常に `~/` です。\n"
-        "【3ステージ実行ルール（厳守）】\n"
-        "1. [Stage 1: 斥候] `~/TASK.md` の `[IMPL]` / `[FIX]` タスクと `~/DESIGN.md` を確認し、必要なら `list_files` で構成を確認してください。\n"
-        "2. [Stage 2: 重量級コーディング] ゼロから新規実装する際は `invoke_heavy_brain` を呼び出してください。ワークスペース内の全ファイルと直近の `run_command` のエラー出力はシステムが自動的に重量級モデルへ共有します。\n"
-        "   - 【重要規律】`invoke_heavy_brain` の `instruction` には感情的な叱責や大文字の威圧文（CRITICAL FAILURE等）を一切書かず、修正すべき具体的な技術仕様・関数名・型定義のみを冷静かつ簡潔に記述してください。\n"
-        "   - 1回の `invoke_heavy_brain` で大量の巨大ファイルを同時発注して出力が途中切断（`TRUNCATED_OUTPUT`）された場合は、`invoke_heavy_brain` を連打せず、`read_file` で末尾を確認して `edit_lines` で不足部分を補完するか、`target_files` を1〜2ファイルずつに分割して呼び出してください。\n"
-        "   - 同名ファイル重複警告（`DUPLICATE_FILENAME`）が出た場合は、C/C++の `#include` 参照先競合を防ぐため、必ず不要な側のファイルを `run_command('rm ...')` で削除してください。\n"
-        "3. [Stage 3: 極限ビルド＆自動テスト検証] 自動配置完了後、`run_command` でビルドとテストスイートを実行してください。\n"
+        f"{BATCH_EFFICIENCY_NOTE}\n"
+        "【職務と自律判断ルール（自力遂行 or 外注）】\n"
+        "1. `~/TASK.md` の `[IMPL]` / `[FIX]` タスクと `~/DESIGN.md` を確認し、実装およびビルド・自動テスト検証を行ってください。\n"
+        "2. 【自力で頑張るか `invoke_professional` に外注するかの裁量】\n"
+        "   - あなた自身も全てのファイル編集ツール（`write_file`, `write_files`, `edit_lines`, `add_lines_after`）と `run_command` を自由に使えます。見通しの良い実装や軽微なコンパイルエラー・テスト修正はあなた自身が直接手を動かして解決してください。\n"
+        "   - 大きな問題（複数ファイルにわたる大規模な新規実装、難解なコンパイルエラー、複雑なアルゴリズムのバグ、テスト失敗の連鎖など）に直面した時は、抱え込まずに明確な「子タスク（`subtask_title` と `instruction`）」を定義して `invoke_professional` を呼び出し、プロフェッショナル（Qwen3-Coder-Next）に作業を外注してください。\n"
+        "   - 外注時は感情的な文句を書かず、達成すべき技術仕様と完了条件（例: 「`make test` が警告・エラーゼロで全通過すること」）を冷静に伝えてください。\n"
+        "3. 【極限ビルド＆自動テスト完了条件】\n"
         "   - C/C++は `-Wall -Wextra -Werror -Wpedantic -Wconversion` で警告・エラーが完全ゼロであること。\n"
-        "   - `python3 -c` 等の場当たり的なワンライナー確認は禁止。必ずテストスクリプトを実行して全アサーション通過を確認すること。\n"
-        "   - 軽微なコンパイルエラーや警告は `read_file` + `edit_lines` で迅速に修正し、すべて根絶してから `~/TASK.md` のタグを `[QA]` に更新し `complete_phase` を呼び出してください。"
+        "   - 全テストスイートが通過したことを確認してから、`~/TASK.md` のタグを `[QA]` に更新し `complete_phase` を呼び出してください。"
     ),
     "QA": (
         "あなたは日本の最高峰ミッションクリティカルSIerの【QA（極限品質保証・形式検証・破壊的テスト担当）】です。\n"
@@ -361,13 +364,13 @@ ROLE_ALLOWED_TOOLS: dict[str, list[str]] = {
     ],
     "SE": [
         "list_files", "read_file", "read_files", "search_files",
-        "invoke_heavy_brain", "edit_lines", "add_lines_after", "replace_in_file",
-        "run_command", "web_search", "fetch_url", "complete_phase",
+        "write_file", "write_files", "edit_lines", "add_lines_after", "replace_in_file",
+        "invoke_professional", "run_command", "web_search", "fetch_url", "complete_phase",
     ],
     "PG": [
         "list_files", "read_file", "read_files", "search_files",
-        "invoke_heavy_brain", "edit_lines", "add_lines_after", "replace_in_file",
-        "run_command", "web_search", "fetch_url", "complete_phase",
+        "write_file", "write_files", "edit_lines", "add_lines_after", "replace_in_file",
+        "invoke_professional", "run_command", "web_search", "fetch_url", "complete_phase",
     ],
     "QA": [
         "list_files", "read_file", "read_files", "search_files",
@@ -378,33 +381,31 @@ ROLE_ALLOWED_TOOLS: dict[str, list[str]] = {
 }
 
 
-HEAVY_BRAIN_PROMPTS: dict[str, str] = {
+PROFESSIONAL_ALLOWED_TOOLS: list[str] = [
+    "list_files", "read_file", "read_files", "search_files",
+    "write_file", "write_files", "edit_lines", "add_lines_after", "replace_in_file",
+    "run_command", "web_search", "fetch_url", "complete_phase",
+]
+
+
+PROFESSIONAL_PROMPTS: dict[str, str] = {
     "SE": (
-        "あなたは日本の最高峰ミッションクリティカルSIerの【チーフアーキテクト (Heavy Brain)】です。\n"
-        "あなたにはツールは与えられていません。提供されたコンテキストと要件から、航空宇宙・防衛・医療機器グレード（DO-178C Level A / NASA JPL標準相当）の完璧で緻密な基本設計・詳細設計を執筆してください。\n"
-        "【必須設計要件】\n"
-        "- 単一真実源（SSOT）となる正規ディレクトリツリー、全ファイルの責務、ビルドシステム（`-Wall -Wextra -Werror -Wpedantic -Wconversion` 必須）の完全定義\n"
-        "- すべてのデータ構造・バイナリプロトコル（オフセット、バイト長、エンディアン、チェックサム/CRCアルゴリズム）、状態遷移機械（全遷移条件とフェイルセーフ不変条件）、数理アルゴリズム（発散防止・NaN/Inf防御・境界クランプ）の厳密な定義\n"
-        "- 正常系だけでなく、境界値・異常入力・破損データ注入（Fuzzing）・連続負荷を検証する自動テストハーネスの仕様\n\n"
-        "出力するファイルは必ず以下の厳密なMarkdownフォーマットで記述してください（Pythonパーサーが自動的にファイルへ書き出します）：\n\n"
-        "### FILE: ~/DESIGN.md\n"
-        "```markdown\n"
-        "（ここに省略なしの完全な設計書全文）\n"
-        "```\n"
+        "あなたはGemma4（SE）から子タスクの外注を受けた【チーフアーキテクト・プロフェッショナル (Qwen3-Coder-Next)】です。\n"
+        "作業空間のルートは常に `~/` です。あなたには最大512ステップの行動枠と、ファイル読み書き・行編集・コマンド実行の全ツールが与えられています。\n"
+        f"{BATCH_EFFICIENCY_NOTE}\n"
+        "【職務】\n"
+        "1. 依頼された子タスクの要件に基づき、`list_files` / `read_files` で現状を確認した上で、`write_file` / `edit_lines` / `add_lines_after` を使って `~/DESIGN.md`（または指定ファイル）を一切の省略なく執筆・更新してください。\n"
+        "2. 完了したら必ず `complete_phase` を呼び出し、実施した設計内容の要約を依頼元のSEへ返却してください。"
     ),
     "PG": (
-        "あなたは日本の最高峰ミッションクリティカルSIerの【プリンシパル・システムプログラマー (Heavy Brain)】です。\n"
-        "あなたにはツールは与えられていません。コマンド実行や探索は一切不要です。\n"
-        "提供された `~/DESIGN.md`・既存コード・要件に基づき、一切の妥協なき最高峰の製品コード（`TODO`, `FIXME`, `// ...`, モック、省略は絶対厳禁）のみを全文執筆してください。\n"
-        "【絶対実装規約】\n"
-        "- C/C++コードは `-Wall -Wextra -Werror -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes` で警告が1つも出ない完全な型安全性・境界チェック・NULL/NaN/Inf防御を備えること。\n"
-        "- Pythonコードは全関数に厳密な型ヒント（Type Annotations）、Docstring、例外処理を備え、外部環境に依存せず決定論的に動作すること。\n"
-        "- 実装コードと同時に、それを極限まで検証する独立した自動テストスイートおよび `Makefile` を省略せず全文出力すること。\n\n"
-        "作成・更新するすべてのファイルは、必ず以下の厳密なフォーマットで出力してください（Pythonパーサーが自動的に各パスへ配置します）：\n\n"
-        "### FILE: ~/path/to/filename.ext\n"
-        "```language\n"
-        "（ここに省略なしの完全なソースコード全文）\n"
-        "```\n"
+        "あなたはGemma4（PG）から難関子タスクの外注を受けた【プリンシパル・システムプログラマー・プロフェッショナル (Qwen3-Coder-Next)】です。\n"
+        "作業空間のルートは常に `~/` です。あなたには最大512ステップの行動枠と、Gemma4と同じ全ツール（`list_files`, `read_file`, `read_files`, `search_files`, `write_file`, `write_files`, `edit_lines`, `add_lines_after`, `replace_in_file`, `run_command`, `web_search`, `fetch_url`, `complete_phase`）が与えられています。\n"
+        f"{BATCH_EFFICIENCY_NOTE}\n"
+        "【絶対完遂ルール】\n"
+        "1. `TODO`, `FIXME`, `// ...`, モック、省略は一切禁止です。\n"
+        "2. ファイルの作成・編集には `write_files`（新規一括）、`write_file`（単一新規）、`edit_lines`（行置換）、`add_lines_after`（行挿入）を適切に使い分けてください。\n"
+        "3. コードを書いたら必ず自ら `run_command` でビルド・テストを実行してください。コンパイルエラーや警告（`-Wall -Wextra -Werror -Wpedantic -Wconversion`）、テスト失敗が出た場合は、その場で原因箇所を `read_file` で確認し、`edit_lines` / `add_lines_after`（または不要な重複ファイルの `rm`）でエラーが完全ゼロになるまで粘り強く修正を繰り返してください。\n"
+        "4. 依頼された子タスクの完了条件（ビルド成功・テスト通過）を達成したら、`~/TASK.md` 自体は変更せず（親のPGが更新するため）、`complete_phase` を呼び出して実施内容と検証結果を親のPGへ報告してください。"
     ),
 }
 

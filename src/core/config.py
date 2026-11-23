@@ -244,6 +244,10 @@ def get_max_steps_per_phase() -> int:
     return require_env_int("MAX_STEPS_PER_PHASE")
 
 
+def get_professional_max_steps() -> int:
+    return require_env_int("PROFESSIONAL_MAX_STEPS")
+
+
 def get_pipeline_idle_sec() -> int:
     return require_env_int("PIPELINE_IDLE_SEC")
 

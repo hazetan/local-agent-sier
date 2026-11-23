@@ -5,12 +5,18 @@ from typing import Any
 import aiohttp
 
 from core.config import (
+    get_heavy_ctx_size,
     get_max_ctx_chars_budget,
     get_max_steps_per_phase,
+    get_professional_max_steps,
     get_sandbox_env_hint,
     get_server_ctx_size,
 )
-from core.llm_client import chat_step, generate_heavy_brain
+from core.llm_client import (
+    chat_step,
+    professional_chat_step,
+    professional_session,
+)
 from core.logger import RoleLogger, error_logger, system_logger
 from core.telemetry import telemetry
 from sandbox.tools import (
@@ -22,7 +28,8 @@ from sandbox.tools import (
 )
 
 from .roles import (
-    HEAVY_BRAIN_PROMPTS,
+    PROFESSIONAL_ALLOWED_TOOLS,
+    PROFESSIONAL_PROMPTS,
     ROLE_ALLOWED_TOOLS,
     ROLE_PROMPTS,
     get_tools_for_role,
@@ -89,18 +96,6 @@ def _enforce_context_budget(messages: list[dict[str, Any]], budget_chars: int) -
         del messages[3]
 
 
-def _is_task_md_only_edit(fn_name: str, parsed_args: dict[str, Any]) -> bool:
-    """edit_lines / add_lines_after / replace_in_file の対象が ~/TASK.md のみかどうか判定する"""
-    if fn_name == "replace_in_file":
-        return "TASK.md" in str(parsed_args.get("path", ""))
-    if fn_name in ("edit_lines", "add_lines_after"):
-        items = parsed_args.get("edits") or parsed_args.get("insertions")
-        if isinstance(items, list) and items:
-            return all("TASK.md" in str(item.get("path", "")) for item in items if isinstance(item, dict))
-        return "TASK.md" in str(parsed_args.get("path", ""))
-    return False
-
-
 def _build_auto_heavy_args(role: str) -> dict[str, Any]:
     """
     軽量モデル(Gemma4)が思考ループ等で invoke_heavy_brain を呼べなかった際、
@@ -154,11 +149,14 @@ async def run_role_phase(
     max_steps: int | None = None,
     require_heavy: bool | None = None,
 ) -> tuple[str, list[str]]:
+    """
+    各ロール (PM, SE, PG, QA, AUDITOR) のメインループ。
+    SE/PG (Gemma4) は自分で直接ツールを使って実装・コマンド実行してもよく、
+    難題に当たった場合は子タスクを定義して invoke_professional で Qwen3-Coder-Next に外注することもできる。
+    """
+    _ = require_heavy  # 強制ガード撤廃（後方互換のため引数は維持）
     role = role.upper()
     telemetry.start_role(role)
-
-    if require_heavy is None:
-        require_heavy = role in ("SE", "PG")
 
     steps_limit = max_steps or get_max_steps_per_phase()
     srv_ctx = get_server_ctx_size() or 65536
@@ -167,7 +165,7 @@ async def run_role_phase(
     logger = RoleLogger(role)
     tools = get_tools_for_role(ROLE_ALLOWED_TOOLS[role])
 
-    system_logger.log("RUNNER", f"▶ Start role={role} (max_steps={steps_limit}, require_heavy={require_heavy})")
+    system_logger.log("RUNNER", f"▶ Start role={role} (max_steps={steps_limit})")
 
     system_prompt = ROLE_PROMPTS[role]
     if role in ("SE", "PG", "QA"):
@@ -185,8 +183,7 @@ async def run_role_phase(
     final_summary = ""
     header_logged = False
     no_tool_streak = 0
-    heavy_invoked = False
-    heavy_apply_history: list[tuple[str, ...]] = []
+    pro_invoked_count = 0
     actual_steps = 0
 
     try:
@@ -214,40 +211,11 @@ async def run_role_phase(
                 if telemetry.on_raw_update:
                     await telemetry.on_raw_update()
 
-                # --- フェイルセーフ: SE/PGで2回連続ツール不発ならランナーが自動的にHeavy Brainを起動 ---
-                if require_heavy and not heavy_invoked and no_tool_streak >= 2:
-                    system_logger.log(
-                        "RUNNER",
-                        f"[{role}] Light model failed to call tools {no_tool_streak} times. Auto-triggering invoke_heavy_brain!",
-                        level="WARN",
-                    )
-                    heavy_invoked = True
-                    no_tool_streak = 0
-                    auto_args = _build_auto_heavy_args(role)
-                    output = await _execute_heavy_brain_stage(
-                        role, step, steps_limit, auto_args, logger, messages, heavy_apply_history
-                    )
-                    telemetry.add_branch_event(role, "invoke_heavy_brain(auto)", auto_args, output)
-
-                    messages[1] = {"role": "system", "content": build_fresh_workspace_snapshot()}
-                    del messages[3:]
-                    next_tag = "[IMPL]" if role == "SE" else "[QA]"
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            f"システムが自動的に `invoke_heavy_brain` を実行し、ファイルを生成・配置しました：\n\n"
-                            f"{output[:max_tool_output_chars]}\n\n"
-                            f"続けて `edit_lines`（または `replace_in_file`）で `~/TASK.md` のステータスタグを `{next_tag}` に更新し、"
-                            "`complete_phase` を呼び出してください。"
-                        ),
-                    })
-                    continue
-
                 if no_tool_streak >= 4:
                     error_logger.log_error(
                         f"RUNNER:{role}",
                         f"Aborted after {no_tool_streak} consecutive steps with no tool calls (total_steps={actual_steps}).",
-                        context={"last_thought": thought[:300], "heavy_invoked": heavy_invoked},
+                        context={"last_thought": thought[:300], "pro_invoked_count": pro_invoked_count},
                     )
                     break
 
@@ -255,20 +223,14 @@ async def run_role_phase(
                     messages[1] = {"role": "system", "content": build_fresh_workspace_snapshot()}
                     del messages[3:]
 
-                if require_heavy and not heavy_invoked:
-                    default_target = "['~/DESIGN.md']" if role == "SE" else "['~/対象のファイルパス']"
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            "【必須指示】思考やテキスト回答は不要です。今すぐ `invoke_heavy_brain` ツールを直接呼び出し、"
-                            f"`target_files={default_target}` と `instruction` を指定してください。"
-                        ),
-                    })
-                else:
-                    messages.append({
-                        "role": "user",
-                        "content": "思考は不要です。今すぐツールを直接呼び出すか、`complete_phase` を呼び出して完了してください。",
-                    })
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "思考のみが出力され、ツールが呼び出されませんでした。"
+                        "今すぐ自分でツール（`read_files`, `edit_lines`, `add_lines_after`, `write_file`, `run_command` 等）を呼び出すか、"
+                        "難題であれば `invoke_professional` で子タスクを外注するか、完了していれば `complete_phase` を呼び出してください。"
+                    ),
+                })
                 continue
 
             no_tool_streak = 0
@@ -278,40 +240,13 @@ async def run_role_phase(
                 raw_args = call["function"].get("arguments", {})
                 parsed_args = parse_tool_args(raw_args)
 
-                if require_heavy and not heavy_invoked:
-                    if fn_name == "complete_phase":
-                        output = (
-                            "Error: まだ `invoke_heavy_brain` が実行されていません。"
-                            "必ず `invoke_heavy_brain` を呼び出して重量級モデル (Qwen3-Coder-Next) に執筆させてから完了してください。"
-                        )
-                        logger.log_step(step, thought, fn_name, parsed_args, output, latency, tps=tps)
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": call.get("id", f"call_{step}"),
-                            "name": fn_name,
-                            "content": output,
-                        })
-                        continue
-
-                    if fn_name in ("edit_lines", "add_lines_after", "replace_in_file", "write_file", "write_files") and not _is_task_md_only_edit(fn_name, parsed_args):
-                        output = (
-                            f"Error: `{fn_name}` による直接執筆は禁止されています。"
-                            "まずは `invoke_heavy_brain` を呼び出して重量級モデル (Qwen3-Coder-Next) にファイル全文を生成させてください。"
-                        )
-                        logger.log_step(step, thought, fn_name, parsed_args, output, latency, tps=tps)
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": call.get("id", f"call_{step}"),
-                            "name": fn_name,
-                            "content": output,
-                        })
-                        continue
-
-                if fn_name == "invoke_heavy_brain":
-                    heavy_invoked = True
-                    output = await _execute_heavy_brain_stage(
-                        role, step, steps_limit, parsed_args, logger, messages, heavy_apply_history
+                if fn_name in ("invoke_professional", "invoke_heavy_brain"):
+                    pro_invoked_count += 1
+                    output = await _execute_professional_subtask(
+                        role, step, parsed_args, logger, messages
                     )
+                    # 外注完了後、最新のドキュメントスナップショットを更新
+                    messages[1] = {"role": "system", "content": build_fresh_workspace_snapshot()}
                 else:
                     output = await execute_tool(fn_name, parsed_args)
                     logger.log_step(step, thought, fn_name, parsed_args, output, latency, tps=tps)
@@ -349,127 +284,203 @@ async def run_role_phase(
             if phase_done:
                 break
 
-        if require_heavy and not heavy_invoked:
-            error_logger.log_heavy_failure(
-                role, "NOT_INVOKED", "PHASE_END",
-                f"Role {role} ended after {actual_steps} step(s) (limit={steps_limit}) without invoking Heavy Brain.",
-                diagnostics={"actual_steps": actual_steps, "steps_limit": steps_limit, "summary_len": len(final_summary)},
-            )
-
-        system_logger.log("RUNNER", f"■ End role={role} (steps={actual_steps}, heavy_used={heavy_invoked}, summary_len={len(final_summary)})")
+        system_logger.log(
+            "RUNNER",
+            f"■ End role={role} (steps={actual_steps}, pro_outsourced={pro_invoked_count}, summary_len={len(final_summary)})",
+        )
         return final_summary, created_zips
     finally:
         telemetry.end_role(role)
 
 
-async def _execute_heavy_brain_stage(
+async def _execute_professional_subtask(
     role: str,
-    step: int,
-    steps_limit: int,
+    parent_step: int,
     parsed_args: dict[str, Any],
     logger: RoleLogger,
-    messages: list[dict[str, Any]] | None = None,
-    heavy_apply_history: list[tuple[str, ...]] | None = None,
+    parent_messages: list[dict[str, Any]] | None = None,
 ) -> str:
     """
-    Stage 2 & Stage 3 (Auto-Apply):
-    ワークスペース全ファイルと直近のコマンド実行ログ（コンパイルエラー等）を無制限で重量級モデルに共有し、
-    出力された '### FILE:' ブロックを自動保存・検品（切断・重複・無限ループ検知）する。
+    Gemma4 から外注された子タスクを、Professional (Qwen3-Coder-Next) が
+    同じツール群（ファイル操作・行編集・コマンド実行）を用いて PROFESSIONAL_MAX_STEPS まで自律遂行する。
     """
-    raw_ctx_paths = parsed_args.get("context_paths") or []
-    if isinstance(raw_ctx_paths, str):
-        raw_ctx_paths = [p.strip() for p in raw_ctx_paths.split(",") if p.strip()]
-
+    pro_max_steps = get_professional_max_steps()
+    subtask_title = str(parsed_args.get("subtask_title") or "Outsourced Subtask").strip()
+    pro_instruction = str(parsed_args.get("instruction") or "子タスクを完遂してください。").strip()
     raw_targets = parsed_args.get("target_files") or []
     if isinstance(raw_targets, str):
         raw_targets = [p.strip() for p in raw_targets.split(",") if p.strip()]
-    if not raw_targets and role == "SE":
-        raw_targets = ["~/DESIGN.md"]
 
-    heavy_instruction = str(parsed_args.get("instruction", "")).strip() or "タスク要件に従い、完全な設計または実装を行ってください。"
-    all_read_paths = list(dict.fromkeys(["~/", *raw_ctx_paths, *raw_targets]))
+    system_logger.log(
+        "RUNNER",
+        f"[{role}:PRO] ▶ Outsourced subtask='{subtask_title}' (targets={raw_targets}, max_steps={pro_max_steps})",
+    )
+    logger.log_step(
+        parent_step,
+        f"[Outsourced to Professional] Subtask: {subtask_title}",
+        "invoke_professional",
+        parsed_args,
+        f"Starting Professional {pro_max_steps}-step autonomous session...",
+    )
 
-    system_logger.log("RUNNER", f"[{role}:HEAVY] Invoking Heavy Brain for targets={raw_targets}")
-    bundle_text = await asyncio.to_thread(build_heavy_context_bundle, all_read_paths)
-    snapshot = build_fresh_workspace_snapshot(max_chars_per_doc=100000)
-    recent_cmd_logs = _extract_recent_command_logs(messages or [])
-
-    heavy_sys_prompt = HEAVY_BRAIN_PROMPTS.get(role, HEAVY_BRAIN_PROMPTS["PG"])
+    pro_tools = get_tools_for_role(PROFESSIONAL_ALLOWED_TOOLS)
+    pro_sys_prompt = PROFESSIONAL_PROMPTS.get(role, PROFESSIONAL_PROMPTS["PG"])
     env_hint = get_sandbox_env_hint()
     if env_hint:
-        heavy_sys_prompt += f"\n\n{env_hint}"
+        pro_sys_prompt += f"\n\n{env_hint}"
 
-    target_fmt_hint = "\n".join(f"- `### FILE: {t}`" for t in raw_targets) or "- `### FILE: ~/path/to/file`"
-    heavy_user_prompt = (
-        f"{snapshot}\n\n"
-        f"=== ワークスペース全ファイル＆ディレクトリ構成 (Full Workspace Context) ===\n{bundle_text}\n\n"
-        f"=== 直近のビルド・テスト・コマンド実行結果 (Recent Command Outputs) ===\n{recent_cmd_logs}\n\n"
-        f"=== 執筆・実装指示 ===\n{heavy_instruction}\n\n"
-        f"=== 出力対象ファイル（必ず以下のヘッダとコードブロックで全文を出力すること） ===\n{target_fmt_hint}\n"
+    bundle_text = await asyncio.to_thread(build_heavy_context_bundle, ["~/", *raw_targets])
+    snapshot = build_fresh_workspace_snapshot(max_chars_per_doc=100000)
+    recent_cmd_logs = _extract_recent_command_logs(parent_messages or [])
+    targets_line = f"\n【主な対象ファイル】: {', '.join(raw_targets)}" if raw_targets else ""
+
+    initial_user_prompt = (
+        f"=== 外注された子タスク: {subtask_title} ==={targets_line}\n"
+        f"{pro_instruction}\n\n"
+        f"=== 直近のビルド・テスト・コマンド実行結果 ===\n{recent_cmd_logs}\n\n"
+        f"=== ワークスペース初期スナップショット ===\n{bundle_text}\n\n"
+        "上記の状況を踏まえ、ツール（`edit_lines`, `add_lines_after`, `write_file`, `write_files`, `run_command` 等）を直接呼び出して作業を開始し、"
+        "ビルドやテストの通過を確認したら `complete_phase` で完了報告を行ってください。"
     )
 
-    telemetry.record_raw_step(
-        f"{role}:HEAVY", "HEAVY_MODEL", step, steps_limit, 0.0,
-        "(Heavy Brain 推論開始...)", "invoke_heavy_brain", parsed_args, "(執筆中...)",
-    )
-    if telemetry.on_raw_update:
-        await telemetry.on_raw_update()
+    pro_messages: list[dict[str, Any]] = [
+        {"role": "system", "content": pro_sys_prompt},
+        {"role": "system", "content": snapshot},
+        {"role": "user", "content": initial_user_prompt},
+    ]
+
+    heavy_ctx = get_heavy_ctx_size() or get_server_ctx_size() or 65536
+    pro_char_budget = min(get_max_ctx_chars_budget(is_heavy=True), int(heavy_ctx * 2.0))
+    max_tool_out_chars = int(pro_char_budget * 0.4)
+
+    action_history: list[str] = []
+    pro_summary = ""
+    no_tool_streak = 0
+    pro_steps_taken = 0
 
     try:
-        thinking_text, clean_md, h_latency, h_model, h_tps = await generate_heavy_brain(
-            role, heavy_sys_prompt, heavy_user_prompt
-        )
+        async with professional_session(role) as pro_model_name:
+            for p_step in range(1, pro_max_steps + 1):
+                pro_steps_taken = p_step
+                _enforce_context_budget(pro_messages, pro_char_budget)
+
+                resp_msg, p_latency, _, p_tps = await professional_chat_step(
+                    role, pro_model_name, pro_messages, tools=pro_tools
+                )
+                p_thought = (resp_msg.get("content") or "").strip()
+                p_clean = (resp_msg.get("_clean_content") or "").strip()
+                p_calls = resp_msg.get("tool_calls") or []
+                pro_messages.append(resp_msg)
+
+                if not p_calls:
+                    if "### FILE:" in p_clean:
+                        applied = await asyncio.to_thread(auto_apply_heavy_markdown, p_clean, raw_targets)
+                        if applied:
+                            no_tool_streak = 0
+                            auto_msg = "Auto-applied markdown files:\n" + "\n".join(f"  - {a}" for a in applied)
+                            action_history.append(f"[Pro Step {p_step}] auto_apply_markdown -> {len(applied)} file(s)")
+                            logger.log_step(
+                                parent_step, f"[PRO {p_step}/{pro_max_steps}] {p_thought}",
+                                "auto_apply_markdown", {"targets": raw_targets}, auto_msg, p_latency, tps=p_tps,
+                            )
+                            telemetry.record_raw_step(
+                                f"{role}:PRO", pro_model_name, p_step, pro_max_steps, p_latency,
+                                p_thought, "auto_apply_markdown", {"targets": raw_targets}, auto_msg, tps=p_tps,
+                            )
+                            if telemetry.on_raw_update:
+                                await telemetry.on_raw_update()
+                            pro_messages.append({
+                                "role": "user",
+                                "content": f"{auto_msg}\n続けて `run_command` でビルド・テストを実行するか、完了なら `complete_phase` を呼んでください。",
+                            })
+                            continue
+
+                    no_tool_streak += 1
+                    logger.log_step(
+                        parent_step, f"[PRO {p_step}/{pro_max_steps}] {p_thought}",
+                        latency_sec=p_latency, tps=p_tps,
+                    )
+                    telemetry.record_raw_step(
+                        f"{role}:PRO", pro_model_name, p_step, pro_max_steps, p_latency, p_thought, tps=p_tps
+                    )
+                    if telemetry.on_raw_update:
+                        await telemetry.on_raw_update()
+
+                    if no_tool_streak >= 4:
+                        pro_summary = f"(Professional stopped after {no_tool_streak} steps without tool calls. Last response: {p_clean[:600]})"
+                        break
+
+                    pro_messages.append({
+                        "role": "user",
+                        "content": (
+                            "ツールが呼び出されませんでした。`edit_lines`, `add_lines_after`, `write_file`, `run_command` 等のツールを呼び出すか、"
+                            "子タスクが完了していれば `complete_phase` を呼び出してください。"
+                        ),
+                    })
+                    continue
+
+                no_tool_streak = 0
+                subtask_done = False
+                for call in p_calls:
+                    fn_name = call["function"]["name"]
+                    p_args = parse_tool_args(call["function"].get("arguments", {}))
+
+                    if fn_name in ("invoke_professional", "invoke_heavy_brain"):
+                        t_out = "Error: あなた自身が既に Professional です。直接ツールを使って作業してください。"
+                    else:
+                        t_out = await execute_tool(fn_name, p_args)
+
+                    first_line = t_out.strip().splitlines()[0][:100] if t_out.strip() else "(ok)"
+                    action_history.append(f"[Pro Step {p_step}] {fn_name} -> {first_line}")
+
+                    logger.log_step(
+                        parent_step, f"[PRO {p_step}/{pro_max_steps}] {p_thought}",
+                        fn_name, p_args, t_out, p_latency, tps=p_tps,
+                    )
+                    telemetry.record_raw_step(
+                        f"{role}:PRO", pro_model_name, p_step, pro_max_steps, p_latency,
+                        p_thought, fn_name, p_args, t_out, tps=p_tps,
+                    )
+                    telemetry.add_branch_event(role, f"PRO:{fn_name}", p_args, t_out)
+                    if telemetry.on_raw_update:
+                        await telemetry.on_raw_update()
+
+                    trimmed_out = (
+                        t_out[:max_tool_out_chars] + f"\n...(truncated at {max_tool_out_chars:,} chars)..."
+                        if len(t_out) > max_tool_out_chars
+                        else t_out
+                    )
+                    pro_messages.append({
+                        "role": "tool",
+                        "tool_call_id": call.get("id", f"pro_call_{p_step}"),
+                        "name": fn_name,
+                        "content": trimmed_out,
+                    })
+
+                    if fn_name == "complete_phase":
+                        pro_summary = t_out
+                        subtask_done = True
+                        break
+
+                if subtask_done:
+                    break
     except (RuntimeError, aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
-        err_msg = f"Heavy Brain Execution Failed ({type(exc).__name__}): {exc}"
-        system_logger.log("RUNNER", f"[{role}:HEAVY] {err_msg}", level="ERROR")
-        return f"Error in invoke_heavy_brain: {err_msg} (詳細は logs/error.log を参照)"
+        err_msg = f"Professional Subtask Failed ({type(exc).__name__}): {exc}"
+        system_logger.log("RUNNER", f"[{role}:PRO] {err_msg}", level="ERROR")
+        return f"Error in invoke_professional: {err_msg} (詳細は logs/error.log を参照)"
 
-    applied_files = await asyncio.to_thread(auto_apply_heavy_markdown, clean_md, raw_targets)
-    if not applied_files:
-        error_logger.log_heavy_failure(
-            role, h_model, "AUTO_APPLY_PARSE",
-            "Heavy model succeeded, but no valid '### FILE:' blocks could be applied.",
-            diagnostics={"targets": raw_targets, "output_preview": clean_md[:400]},
-        )
+    if not pro_summary:
+        pro_summary = f"(Reached {pro_steps_taken} steps without explicit complete_phase)"
 
-    loop_warning = ""
-    if heavy_apply_history is not None:
-        current_sig = tuple(af for af in applied_files if not af.startswith("[WARNING:"))
-        if current_sig and heavy_apply_history and heavy_apply_history[-1] == current_sig:
-            loop_warning = (
-                "\n\n🚨 [CIRCUIT BREAKER: 同一ファイル反復生成の検知]\n"
-                "前回と全く同じ行数・文字数のファイルが再生成されました。同じファイルに対する `invoke_heavy_brain` の再呼び出しを禁止します。\n"
-                "コンパイルエラーが解消しない原因は、別ディレクトリにある同名重複ヘッダ（例: `src/logic/*.hpp` と `include/*.hpp`）が優先インクルードされているか、"
-                "呼び出し側ファイルとの不整合にあります。`list_files` で重複ファイルを確認して `run_command('rm ...')` で削除するか、"
-                "`read_file` と `edit_lines` を用いて直接ピンポイント修正してください。"
-            )
-        if current_sig:
-            heavy_apply_history.append(current_sig)
-
-    summary_header = (
-        f"[Heavy Brain ({h_model}) Completed in {h_latency:.1f}s ({h_tps:.2f} tok/s)]\n"
-        f"Auto-applied files ({len(applied_files)}):\n"
-        + ("\n".join(f"  - {af}" for af in applied_files) if applied_files else "  - (No '### FILE:' blocks detected)")
-        + loop_warning
+    history_tail = "\n".join(action_history[-25:]) if action_history else "  (No tool actions recorded)"
+    system_logger.log(
+        "RUNNER",
+        f"[{role}:PRO] ■ Subtask='{subtask_title}' finished in {pro_steps_taken} step(s).",
     )
-
-    if len(clean_md) > 5000:
-        preview_block = f"{clean_md[:2500]}\n\n...(中略)...\n\n{clean_md[-2500:]}"
-    else:
-        preview_block = clean_md
-    tool_output = f"{summary_header}\n\n[Heavy Brain Output Preview (Head & Tail)]\n{preview_block}"
-
-    combined_thought = (
-        f"[Heavy Brain Thinking ({h_model})]\n{thinking_text[:600]}"
-        if thinking_text
-        else f"[Heavy Brain Output ({h_model})]\n{clean_md[:600]}"
+    return (
+        f"=== Professional (Qwen3-Coder-Next) 子タスク完了報告 ===\n"
+        f"- 子タスク名: {subtask_title}\n"
+        f"- 実行ステップ数: {pro_steps_taken} / {pro_max_steps}\n"
+        f"- 完了サマリ:\n{pro_summary}\n\n"
+        f"- 直近の実行アクション履歴:\n{history_tail}"
     )
-    logger.log_step(step, combined_thought, "invoke_heavy_brain", parsed_args, summary_header, h_latency, tps=h_tps)
-    telemetry.record_raw_step(
-        f"{role}:HEAVY", h_model, step, steps_limit, h_latency, combined_thought,
-        "invoke_heavy_brain", parsed_args, summary_header, tps=h_tps,
-    )
-    if telemetry.on_raw_update:
-        await telemetry.on_raw_update()
-
-    return tool_output

@@ -76,7 +76,7 @@ class SystemTelemetry:
         if not self.active_roles:
             return "IDLE"
         labels = [
-            f"{r}:HEAVY" if r in self.heavy_active_roles else r
+            f"{r}:PRO" if r in self.heavy_active_roles else r
             for r in sorted(self.active_roles)
         ]
         return ",".join(labels)

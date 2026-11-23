@@ -3,6 +3,8 @@ import asyncio
 import json
 import re
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import aiohttp
@@ -679,14 +681,11 @@ async def _unload_models_for_heavy(keep_model_name: str) -> None:
 _heavy_lock = asyncio.Lock()
 
 
-async def generate_heavy_brain(
-    role: str,
-    system_prompt: str,
-    user_prompt: str,
-) -> tuple[str, str, float, str, float]:
+@asynccontextmanager
+async def professional_session(role: str) -> AsyncIterator[str]:
     """
-    Stage 2 (Pure Brain): 重量モデル (Qwen3-Coder-Next) をツール無しで1回だけ呼び出し、
-    失敗時は原因（モデル未pull、VRAM/RAM不足、タイムアウト等）を logs/error.log へ明示的に記録する。
+    Professional (Qwen3-Coder-Next) が最大512ステップ連続稼働する間、
+    排他ロックを保持して軽量モデルをアンロードし、VRAMスワップゼロで常駐させるコンテキストマネージャ。
     """
     try:
         model_name = get_heavy_model_for_role(role)
@@ -695,37 +694,6 @@ async def generate_heavy_brain(
         error_logger.log_heavy_failure(role, "UNCONFIGURED", "CONFIG_LOAD", str(exc), exc=exc)
         raise
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
-    prepared_msgs = _prepare_messages_for_ollama(messages)
-
-    payload: dict[str, Any] = {
-        "model": model_name,
-        "messages": prepared_msgs,
-        "stream": True,
-    }
-
-    think_setting = get_heavy_ollama_think()
-    if think_setting is not None:
-        payload["think"] = think_setting
-
-    options = get_heavy_ollama_options()
-    if options:
-        payload["options"] = options
-
-    keep_alive = get_heavy_ollama_keep_alive()
-    if keep_alive is not None:
-        payload["keep_alive"] = keep_alive
-    elif model_name != light_model_name:
-        payload["keep_alive"] = 0
-
-    est_chars = len(json.dumps(prepared_msgs, ensure_ascii=False))
-    est_input_tok = max(1, est_chars // 3)
-    telemetry.update_role_tokens(role, est_input_tok)
-
-    start_t = time.perf_counter()
     total_sem, bg_sem = _get_llm_semaphores()
     total_slots = max(1, _configured_parallel)
     bg_slots = max(1, _configured_parallel - 1)
@@ -743,12 +711,13 @@ async def generate_heavy_brain(
                     await total_sem.acquire()
                     acquired_total += 1
 
-                system_logger.log("LLM_CLIENT", f"[{role}:HEAVY] Exclusive lock acquired. Unloading light models for {model_name}...")
+                system_logger.log(
+                    "LLM_CLIENT",
+                    f"[{role}:PRO] Exclusive lock acquired. Unloading light models for '{model_name}'...",
+                )
                 await _unload_models_for_heavy(model_name)
                 try:
-                    msg, prompt_tok, eval_tok, eval_duration_ns, elapsed_req = await _execute_ollama_stream(
-                        role, model_name, payload, est_input_tok
-                    )
+                    yield model_name
                 finally:
                     if model_name != light_model_name:
                         await _unload_models_for_heavy(light_model_name)
@@ -759,6 +728,49 @@ async def generate_heavy_brain(
                     bg_sem.release()
     finally:
         telemetry.set_heavy_mode(role, False)
+
+
+async def professional_chat_step(
+    role: str,
+    model_name: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+) -> tuple[dict[str, Any], float, str, float]:
+    """
+    professional_session 内で呼び出される Qwen3-Coder-Next 用の1ステップ推論関数。
+    Gemma4 と同じネイティブツール呼び出しおよびテキストフォールバック抽出に対応する。
+    """
+    prepared_msgs = _prepare_messages_for_ollama(messages)
+    payload: dict[str, Any] = {
+        "model": model_name,
+        "messages": prepared_msgs,
+        "stream": True,
+    }
+
+    think_setting = get_heavy_ollama_think()
+    if think_setting is not None:
+        payload["think"] = think_setting
+
+    options = get_heavy_ollama_options()
+    if options:
+        payload["options"] = options
+
+    keep_alive = get_heavy_ollama_keep_alive() or "30m"
+    payload["keep_alive"] = keep_alive
+
+    if tools:
+        payload["tools"] = tools
+
+    est_chars = len(json.dumps(prepared_msgs, ensure_ascii=False))
+    if tools:
+        est_chars += len(json.dumps(tools, ensure_ascii=False))
+    est_input_tok = max(1, est_chars // 3)
+    telemetry.update_role_tokens(role, est_input_tok)
+
+    start_t = time.perf_counter()
+    msg, prompt_tok, eval_tok, eval_duration_ns, elapsed_req = await _execute_ollama_stream(
+        role, model_name, payload, est_input_tok
+    )
 
     if prompt_tok == 0:
         prompt_tok = est_input_tok
@@ -776,27 +788,37 @@ async def generate_heavy_brain(
     telemetry.update_role_tokens(role, prompt_tok + eval_tok, tps=tps)
     thinking_text, clean_content = extract_thinking_and_clean(raw_content, explicit_thinking)
 
-    if not clean_content.strip():
-        error_logger.log_heavy_failure(
-            role, model_name, "EMPTY_OUTPUT",
-            "Heavy model returned empty content (only thinking or blank output).",
-            diagnostics={"thinking_len": len(thinking_text), "eval_tok": eval_tok},
+    if not msg.get("tool_calls"):
+        fb_calls = (
+            extract_fallback_tool_calls(clean_content)
+            or extract_fallback_tool_calls(raw_content)
+            or extract_fallback_tool_calls(thinking_text)
         )
+        if fb_calls:
+            msg["tool_calls"] = fb_calls
+
+    msg["_clean_content"] = clean_content
+    if thinking_text and clean_content:
+        msg["content"] = f"[Thinking]\n{thinking_text[:1500]}\n\n[Response]\n{clean_content}"
+    elif thinking_text:
+        msg["content"] = thinking_text[:1500]
+    else:
+        msg["content"] = clean_content
 
     latency = time.perf_counter() - start_t
-    return thinking_text, clean_content, latency, model_name, tps
+    return msg, latency, model_name, tps
 
 
 def extract_fallback_tool_calls(content: str) -> list[dict[str, Any]]:
-    """テキスト内に直接出力されたGemma4独自形式 (call:fn{...}) や関数呼び出し形式のツール呼び出しを抽出する"""
+    """テキスト内に直接出力されたGemma4/Qwen3独自形式 (call:fn{...}) や関数呼び出し形式のツール呼び出しを抽出する"""
     if not content:
         return []
 
     calls: list[dict[str, Any]] = []
 
-    # 1. Gemma4 ネイティブ構文: call:tool_name{...} または tool_name({...})
+    # 1. ネイティブ構文: call:tool_name{...} または tool_name({...})
     for m in re.finditer(
-        r"(?:call:)?\b(invoke_heavy_brain|complete_phase|list_files|read_file|read_files|write_file|write_files|edit_lines|add_lines_after|replace_in_file|search_files|run_command|web_search|fetch_url|export_zip)\s*\(?\s*\{",
+        r"(?:call:)?\b(invoke_professional|invoke_heavy_brain|complete_phase|list_files|read_file|read_files|write_file|write_files|edit_lines|add_lines_after|replace_in_file|search_files|run_command|web_search|fetch_url|export_zip)\s*\(?\s*\{",
         content,
     ):
         fn_name = m.group(1)
