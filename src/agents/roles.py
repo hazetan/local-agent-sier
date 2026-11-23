@@ -145,6 +145,39 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "add_lines_after": {
+        "type": "function",
+        "function": {
+            "name": "add_lines_after",
+            "description": (
+                "Insert new line(s) immediately after 'after_line' (0 = insert at top of file before line 1; "
+                "1..N = insert after that 1-based line number) without deleting existing lines. "
+                "Supports batch inserting across one or multiple files in a single call (applied bottom-up automatically)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "insertions": {
+                        "type": "array",
+                        "description": "List of line insertions to apply in batch.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string", "description": "Target file path (e.g. '~/a/main.py')"},
+                                "after_line": {
+                                    "type": "integer",
+                                    "description": "Line number after which to insert (0 for top of file, or 1-based line number)",
+                                },
+                                "new_text": {"type": "string", "description": "Single-line or multi-line string to insert"},
+                            },
+                            "required": ["path", "after_line", "new_text"],
+                        },
+                    },
+                },
+                "required": ["insertions"],
+            },
+        },
+    },
     "replace_in_file": {
         "type": "function",
         "function": {
@@ -261,9 +294,9 @@ def get_tools_for_role(tool_names: list[str]) -> list[dict[str, Any]]:
 BATCH_EFFICIENCY_NOTE = (
     "【大容量コンテキスト活用・一括処理＆並列安全ルール】\n"
     "- 推論回数を最小化するため、ファイルを1つずつ確認せず `read_files`（複数パスやディレクトリ指定）や `search_files` で一括閲覧してください。\n"
-    "- ファイル閲覧時は左側に1始まりの行番号（`   1 | ...`）が表示されます。部分編集を行う際は `edit_lines` を使い、`start_line` と `end_line` を指定して複数箇所・複数ファイルを1回で一括置換してください。\n"
+    "- ファイル閲覧時は左側に1始まりの行番号（`   1 | ...`）が表示されます。既存行の置換には `edit_lines`、既存行を消さずに後ろへ新規行を追記・挿入する際は `add_lines_after` を使い、複数箇所・複数ファイルを1回で一括編集してください。\n"
     "- 複数ファイルの新規作成には `write_files` を使用して1ステップで完了させてください。\n"
-    "- PMと他部門は並列稼働するため、`~/TASK.md` を更新する際は他部門の追記を消さないよう `write_file` で全文上書きせず、直前に `read_file` で行番号を確認して `edit_lines` または `replace_in_file` で該当箇所のみ部分更新してください。"
+    "- PMと他部門は並列稼働するため、`~/TASK.md` を更新する際は他部門の追記を消さないよう `write_file` で全文上書きせず、直前に `read_file` で行番号を確認して `edit_lines`、`add_lines_after`、または `replace_in_file` で該当箇所のみ部分更新してください。"
 )
 
 ROLE_PROMPTS: dict[str, str] = {
@@ -323,25 +356,25 @@ ROLE_PROMPTS: dict[str, str] = {
 ROLE_ALLOWED_TOOLS: dict[str, list[str]] = {
     "PM": [
         "list_files", "read_file", "read_files", "search_files",
-        "write_file", "write_files", "edit_lines", "replace_in_file",
+        "write_file", "write_files", "edit_lines", "add_lines_after", "replace_in_file",
         "export_zip", "complete_phase",
     ],
     "SE": [
         "list_files", "read_file", "read_files", "search_files",
-        "invoke_heavy_brain", "edit_lines", "replace_in_file",
+        "invoke_heavy_brain", "edit_lines", "add_lines_after", "replace_in_file",
         "run_command", "web_search", "fetch_url", "complete_phase",
     ],
     "PG": [
         "list_files", "read_file", "read_files", "search_files",
-        "invoke_heavy_brain", "edit_lines", "replace_in_file",
+        "invoke_heavy_brain", "edit_lines", "add_lines_after", "replace_in_file",
         "run_command", "web_search", "fetch_url", "complete_phase",
     ],
     "QA": [
         "list_files", "read_file", "read_files", "search_files",
-        "write_file", "write_files", "edit_lines", "replace_in_file",
+        "write_file", "write_files", "edit_lines", "add_lines_after", "replace_in_file",
         "run_command", "complete_phase",
     ],
-    "AUDITOR": ["read_file", "read_files", "write_file", "edit_lines", "complete_phase"],
+    "AUDITOR": ["read_file", "read_files", "write_file", "edit_lines", "add_lines_after", "complete_phase"],
 }
 
 

@@ -90,13 +90,13 @@ def _enforce_context_budget(messages: list[dict[str, Any]], budget_chars: int) -
 
 
 def _is_task_md_only_edit(fn_name: str, parsed_args: dict[str, Any]) -> bool:
-    """edit_lines / replace_in_file の対象が ~/TASK.md のみかどうか判定する"""
+    """edit_lines / add_lines_after / replace_in_file の対象が ~/TASK.md のみかどうか判定する"""
     if fn_name == "replace_in_file":
         return "TASK.md" in str(parsed_args.get("path", ""))
-    if fn_name == "edit_lines":
-        edits = parsed_args.get("edits")
-        if isinstance(edits, list) and edits:
-            return all("TASK.md" in str(item.get("path", "")) for item in edits if isinstance(item, dict))
+    if fn_name in ("edit_lines", "add_lines_after"):
+        items = parsed_args.get("edits") or parsed_args.get("insertions")
+        if isinstance(items, list) and items:
+            return all("TASK.md" in str(item.get("path", "")) for item in items if isinstance(item, dict))
         return "TASK.md" in str(parsed_args.get("path", ""))
     return False
 
@@ -293,7 +293,7 @@ async def run_role_phase(
                         })
                         continue
 
-                    if fn_name in ("edit_lines", "replace_in_file", "write_file", "write_files") and not _is_task_md_only_edit(fn_name, parsed_args):
+                    if fn_name in ("edit_lines", "add_lines_after", "replace_in_file", "write_file", "write_files") and not _is_task_md_only_edit(fn_name, parsed_args):
                         output = (
                             f"Error: `{fn_name}` による直接執筆は禁止されています。"
                             "まずは `invoke_heavy_brain` を呼び出して重量級モデル (Qwen3-Coder-Next) にファイル全文を生成させてください。"

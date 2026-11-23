@@ -795,7 +795,10 @@ def extract_fallback_tool_calls(content: str) -> list[dict[str, Any]]:
     calls: list[dict[str, Any]] = []
 
     # 1. Gemma4 ネイティブ構文: call:tool_name{...} または tool_name({...})
-    for m in re.finditer(r"(?:call:)?\b(invoke_heavy_brain|complete_phase|list_files|read_file|read_files|write_file|write_files|edit_lines|replace_in_file|search_files|run_command|web_search|fetch_url|export_zip)\s*\(?\s*\{", content):
+    for m in re.finditer(
+        r"(?:call:)?\b(invoke_heavy_brain|complete_phase|list_files|read_file|read_files|write_file|write_files|edit_lines|add_lines_after|replace_in_file|search_files|run_command|web_search|fetch_url|export_zip)\s*\(?\s*\{",
+        content,
+    ):
         fn_name = m.group(1)
         brace_start = m.end() - 1
         depth = 0

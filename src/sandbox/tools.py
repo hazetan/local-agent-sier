@@ -548,6 +548,93 @@ def _tool_read_files(args: dict[str, Any]) -> str:
     return "\n\n".join(sections)
 
 
+def _tool_add_lines_after(args: dict[str, Any]) -> str:
+    """
+    指定した行番号 (after_line, 0=ファイル先頭, 1〜総行数=該当行の直後) の後ろに新しい行を挿入する。
+    同一ファイル内の複数箇所への挿入は行番号の降順（下から上）で自動適用し、行ズレを防止する。
+    """
+    raw_insertions = args.get("insertions") or args.get("edits")
+    if isinstance(raw_insertions, list) and raw_insertions:
+        insert_items = raw_insertions
+    elif "path" in args and "after_line" in args:
+        insert_items = [args]
+    else:
+        return "Error: Provide 'insertions' list or ('path', 'after_line', 'new_text')."
+
+    ws = get_workspace_dir().resolve()
+    grouped: dict[Path, list[tuple[int, str]]] = {}
+    errors: list[str] = []
+
+    for idx, item in enumerate(insert_items, 1):
+        if not isinstance(item, dict):
+            continue
+        raw_path = str(item.get("path", "")).strip()
+        target = resolve_workspace_path(raw_path)
+        if not target or not target.exists() or target.is_dir():
+            errors.append(f"Insertion #{idx}: File '{raw_path}' not found.")
+            continue
+        try:
+            after_line = int(item["after_line"])
+        except (KeyError, ValueError, TypeError):
+            errors.append(f"Insertion #{idx} ({raw_path}): 'after_line' must be an integer (>= 0).")
+            continue
+
+        if after_line < 0:
+            errors.append(f"Insertion #{idx} ({raw_path}): Invalid after_line={after_line} (must be >= 0).")
+            continue
+
+        new_text = str(item.get("new_text", item.get("new_content", "")))
+        grouped.setdefault(target, []).append((after_line, new_text))
+
+    if errors:
+        return "Error(s) in add_lines_after:\n" + "\n".join(errors)
+
+    reports: list[str] = []
+
+    for target, ops in grouped.items():
+        rel = target.relative_to(ws)
+        orig_text = target.read_text(encoding="utf-8", errors="replace")
+        lines = orig_text.splitlines()
+        total = len(lines)
+
+        file_err = False
+        for after_line, _ in ops:
+            if after_line > total:
+                reports.append(
+                    f"Error (~/{rel}): after_line={after_line} exceeds file length ({total} lines)."
+                )
+                file_err = True
+                break
+        if file_err:
+            continue
+
+        # 同じ after_line に複数指定された場合は指定順を維持しつつ、異なる行番号は降順（下から上）で挿入
+        indexed_ops = list(enumerate(ops))
+        ops_sorted = sorted(indexed_ops, key=lambda x: (x[1][0], -x[0]), reverse=True)
+
+        total_added = 0
+        for _, (after_line, new_text) in ops_sorted:
+            addition_lines = new_text.splitlines() if new_text != "" else [""]
+            lines[after_line:after_line] = addition_lines
+            total_added += len(addition_lines)
+
+        new_full_text = "\n".join(lines) + ("\n" if lines else "")
+        target.write_text(new_full_text, encoding="utf-8")
+
+        min_line = min(op[0] for op in ops)
+        max_line = max(op[0] for op in ops) + total_added
+        preview_start = max(1, min_line - 1)
+        preview_end = min(len(lines), max_line + 5)
+        preview_body = _format_with_line_numbers(lines[preview_start - 1 : preview_end], start_line=preview_start)
+
+        reports.append(
+            f"Updated ~/{rel} ({len(ops)} insertion(s) applied, +{total_added} lines, now {len(lines)} lines). "
+            f"Preview (lines {preview_start}-{preview_end}):\n{preview_body}"
+        )
+
+    return "\n\n".join(reports)
+
+
 TOOL_DISPATCH = {
     "list_files": _tool_list_files,
     "read_file": _tool_read_file,
@@ -555,6 +642,7 @@ TOOL_DISPATCH = {
     "write_file": _tool_write_file,
     "write_files": _tool_write_files,
     "edit_lines": _tool_edit_lines,
+    "add_lines_after": _tool_add_lines_after,
     "replace_in_file": _tool_replace_in_file,
     "search_files": _tool_search_files,
     "run_command": _tool_run_command,
@@ -586,7 +674,7 @@ async def execute_tool(name: str, raw_args: Any) -> str:
     if not fn:
         return f"Error: Unknown tool '{name}'."
 
-    if name in ("write_file", "write_files", "edit_lines", "replace_in_file"):
+    if name in ("write_file", "write_files", "edit_lines", "add_lines_after", "replace_in_file"):
         async with _file_write_lock:
             return await asyncio.to_thread(fn, args)
 
