@@ -133,6 +133,21 @@ def _build_auto_heavy_args(role: str) -> dict[str, Any]:
     }
 
 
+def _extract_recent_command_logs(messages: list[dict[str, Any]], max_logs: int = 2) -> str:
+    """Gemma4の会話履歴から直近の run_command 実行結果（コンパイルエラーやテスト出力）を抽出する"""
+    logs: list[str] = []
+    for m in reversed(messages):
+        if m.get("role") == "tool" and (m.get("name") == "run_command" or m.get("tool_name") == "run_command"):
+            content = str(m.get("content") or "").strip()
+            if content:
+                logs.append(content)
+                if len(logs) >= max_logs:
+                    break
+    if not logs:
+        return "(まだコマンド実行履歴はありません)"
+    return "\n\n---\n\n".join(reversed(logs))
+
+
 async def run_role_phase(
     role: str,
     instruction: str,
@@ -171,6 +186,7 @@ async def run_role_phase(
     header_logged = False
     no_tool_streak = 0
     heavy_invoked = False
+    heavy_apply_history: list[tuple[str, ...]] = []
     actual_steps = 0
 
     try:
@@ -208,7 +224,9 @@ async def run_role_phase(
                     heavy_invoked = True
                     no_tool_streak = 0
                     auto_args = _build_auto_heavy_args(role)
-                    output = await _execute_heavy_brain_stage(role, step, steps_limit, auto_args, logger)
+                    output = await _execute_heavy_brain_stage(
+                        role, step, steps_limit, auto_args, logger, messages, heavy_apply_history
+                    )
                     telemetry.add_branch_event(role, "invoke_heavy_brain(auto)", auto_args, output)
 
                     messages[1] = {"role": "system", "content": build_fresh_workspace_snapshot()}
@@ -264,7 +282,7 @@ async def run_role_phase(
                     if fn_name == "complete_phase":
                         output = (
                             "Error: まだ `invoke_heavy_brain` が実行されていません。"
-                            f"必ず `invoke_heavy_brain` を呼び出して重量級モデル (Qwen3-Coder-Next) に執筆させてから完了してください。"
+                            "必ず `invoke_heavy_brain` を呼び出して重量級モデル (Qwen3-Coder-Next) に執筆させてから完了してください。"
                         )
                         logger.log_step(step, thought, fn_name, parsed_args, output, latency, tps=tps)
                         messages.append({
@@ -291,7 +309,9 @@ async def run_role_phase(
 
                 if fn_name == "invoke_heavy_brain":
                     heavy_invoked = True
-                    output = await _execute_heavy_brain_stage(role, step, steps_limit, parsed_args, logger)
+                    output = await _execute_heavy_brain_stage(
+                        role, step, steps_limit, parsed_args, logger, messages, heavy_apply_history
+                    )
                 else:
                     output = await execute_tool(fn_name, parsed_args)
                     logger.log_step(step, thought, fn_name, parsed_args, output, latency, tps=tps)
@@ -348,10 +368,13 @@ async def _execute_heavy_brain_stage(
     steps_limit: int,
     parsed_args: dict[str, Any],
     logger: RoleLogger,
+    messages: list[dict[str, Any]] | None = None,
+    heavy_apply_history: list[tuple[str, ...]] | None = None,
 ) -> str:
     """
     Stage 2 & Stage 3 (Auto-Apply):
-    重量級モデル (MODEL_HEAVY) を呼び出し、出力された '### FILE:' ブロックを自動保存する。
+    ワークスペース全ファイルと直近のコマンド実行ログ（コンパイルエラー等）を無制限で重量級モデルに共有し、
+    出力された '### FILE:' ブロックを自動保存・検品（切断・重複・無限ループ検知）する。
     """
     raw_ctx_paths = parsed_args.get("context_paths") or []
     if isinstance(raw_ctx_paths, str):
@@ -364,11 +387,12 @@ async def _execute_heavy_brain_stage(
         raw_targets = ["~/DESIGN.md"]
 
     heavy_instruction = str(parsed_args.get("instruction", "")).strip() or "タスク要件に従い、完全な設計または実装を行ってください。"
-    all_read_paths = list(dict.fromkeys([*raw_ctx_paths, *raw_targets]))
+    all_read_paths = list(dict.fromkeys(["~/", *raw_ctx_paths, *raw_targets]))
 
     system_logger.log("RUNNER", f"[{role}:HEAVY] Invoking Heavy Brain for targets={raw_targets}")
     bundle_text = await asyncio.to_thread(build_heavy_context_bundle, all_read_paths)
-    snapshot = build_fresh_workspace_snapshot()
+    snapshot = build_fresh_workspace_snapshot(max_chars_per_doc=100000)
+    recent_cmd_logs = _extract_recent_command_logs(messages or [])
 
     heavy_sys_prompt = HEAVY_BRAIN_PROMPTS.get(role, HEAVY_BRAIN_PROMPTS["PG"])
     env_hint = get_sandbox_env_hint()
@@ -378,7 +402,8 @@ async def _execute_heavy_brain_stage(
     target_fmt_hint = "\n".join(f"- `### FILE: {t}`" for t in raw_targets) or "- `### FILE: ~/path/to/file`"
     heavy_user_prompt = (
         f"{snapshot}\n\n"
-        f"=== 参照ファイル群 (Context Files) ===\n{bundle_text}\n\n"
+        f"=== ワークスペース全ファイル＆ディレクトリ構成 (Full Workspace Context) ===\n{bundle_text}\n\n"
+        f"=== 直近のビルド・テスト・コマンド実行結果 (Recent Command Outputs) ===\n{recent_cmd_logs}\n\n"
         f"=== 執筆・実装指示 ===\n{heavy_instruction}\n\n"
         f"=== 出力対象ファイル（必ず以下のヘッダとコードブロックで全文を出力すること） ===\n{target_fmt_hint}\n"
     )
@@ -407,12 +432,32 @@ async def _execute_heavy_brain_stage(
             diagnostics={"targets": raw_targets, "output_preview": clean_md[:400]},
         )
 
+    loop_warning = ""
+    if heavy_apply_history is not None:
+        current_sig = tuple(af for af in applied_files if not af.startswith("[WARNING:"))
+        if current_sig and heavy_apply_history and heavy_apply_history[-1] == current_sig:
+            loop_warning = (
+                "\n\n🚨 [CIRCUIT BREAKER: 同一ファイル反復生成の検知]\n"
+                "前回と全く同じ行数・文字数のファイルが再生成されました。同じファイルに対する `invoke_heavy_brain` の再呼び出しを禁止します。\n"
+                "コンパイルエラーが解消しない原因は、別ディレクトリにある同名重複ヘッダ（例: `src/logic/*.hpp` と `include/*.hpp`）が優先インクルードされているか、"
+                "呼び出し側ファイルとの不整合にあります。`list_files` で重複ファイルを確認して `run_command('rm ...')` で削除するか、"
+                "`read_file` と `edit_lines` を用いて直接ピンポイント修正してください。"
+            )
+        if current_sig:
+            heavy_apply_history.append(current_sig)
+
     summary_header = (
         f"[Heavy Brain ({h_model}) Completed in {h_latency:.1f}s ({h_tps:.2f} tok/s)]\n"
         f"Auto-applied files ({len(applied_files)}):\n"
         + ("\n".join(f"  - {af}" for af in applied_files) if applied_files else "  - (No '### FILE:' blocks detected)")
+        + loop_warning
     )
-    tool_output = f"{summary_header}\n\n[Heavy Brain Output Preview]\n{clean_md[:4000]}"
+
+    if len(clean_md) > 5000:
+        preview_block = f"{clean_md[:2500]}\n\n...(中略)...\n\n{clean_md[-2500:]}"
+    else:
+        preview_block = clean_md
+    tool_output = f"{summary_header}\n\n[Heavy Brain Output Preview (Head & Tail)]\n{preview_block}"
 
     combined_thought = (
         f"[Heavy Brain Thinking ({h_model})]\n{thinking_text[:600]}"

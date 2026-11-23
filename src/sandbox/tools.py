@@ -410,6 +410,7 @@ def _tool_search_files(args: dict[str, Any]) -> str:
 
 def _tool_run_command(args: dict[str, Any]) -> str:
     cmd = str(args.get("command", "")).strip()
+    cmd = re.sub(r"(?:</?div>|<channel\|>|<\|channel>thought|```)+$", "", cmd, flags=re.IGNORECASE).strip()
     if not cmd:
         return "Error: Empty command."
     return run_in_sandbox(cmd)
@@ -592,28 +593,47 @@ async def execute_tool(name: str, raw_args: Any) -> str:
     return await asyncio.to_thread(fn, args)
 
 
-def build_heavy_context_bundle(context_paths: list[str]) -> str:
+def _find_duplicate_workspace_files(ws: Path) -> dict[str, list[str]]:
+    """ワークスペース内で同一ファイル名が複数パスに存在する重複ファイル群を検出する"""
+    by_name: dict[str, list[str]] = {}
+    for fpath in _collect_workspace_files(["~/"]):
+        rel = f"~/{fpath.relative_to(ws)}"
+        by_name.setdefault(fpath.name, []).append(rel)
+    return {name: paths for name, paths in by_name.items() if len(paths) > 1}
+
+
+def build_heavy_context_bundle(context_paths: list[str] | None = None) -> str:
     """
-    Stage 2 用に、指定されたファイル・ディレクトリ群をPythonで高速に一括読み込みし、
-    行番号なしのクリーンなテキストバンドルとして結合する。
+    Stage 2 用に、参照制限を一切設けずワークスペース (~/) 全体のディレクトリツリー、
+    同名重複ファイルの警告、および全テキストファイルの全文を一括バンドルする。
     """
     ws = get_workspace_dir().resolve()
     standard_root_docs = {(ws / name).resolve() for name in INITIAL_DOCUMENTS}
-    collected = _collect_workspace_files(context_paths, skip_files=standard_root_docs)
-    if not collected:
-        return "(追加の参照ファイルなし)"
+    extra_paths = list(context_paths or [])
+    all_search_paths = list(dict.fromkeys(["~/", *extra_paths]))
 
-    char_budget = int(get_max_ctx_chars_budget(is_heavy=True) * 0.65)
-    sections: list[str] = []
-    used_chars = 0
+    tree_listing = _tool_list_files({"directory": "~/"})
+    duplicates = _find_duplicate_workspace_files(ws)
+    dup_lines: list[str] = []
+    if duplicates:
+        dup_lines.append("⚠️ [CRITICAL WARNING: DUPLICATE FILENAMES DETECTED IN WORKSPACE]")
+        for fname, paths in sorted(duplicates.items()):
+            dup_lines.append(f"  - '{fname}' exists in multiple locations: {', '.join(paths)}")
+
+    collected = _collect_workspace_files(all_search_paths, skip_files=standard_root_docs)
+    sections: list[str] = [f"=== WORKSPACE FULL DIRECTORY TREE ===\n{tree_listing}"]
+    if dup_lines:
+        sections.append("\n".join(dup_lines))
+
+    if not collected:
+        sections.append("(ワークスペース内に追加のソースファイルはまだ存在しません)")
+        return "\n\n".join(sections)
+
     for fpath in collected:
         rel = fpath.relative_to(ws)
         text = fpath.read_text(encoding="utf-8", errors="replace")
-        if used_chars + len(text) > char_budget and sections:
-            sections.append(f"=== ~/{rel} (Skipped: Heavy context budget reached) ===")
-            continue
-        sections.append(f"=== FILE: ~/{rel} ===\n{text}")
-        used_chars += len(text)
+        line_cnt = len(text.splitlines())
+        sections.append(f"=== FILE: ~/{rel} ({line_cnt} lines, {len(text)} chars) ===\n{text}")
 
     return "\n\n".join(sections)
 
@@ -630,25 +650,27 @@ def auto_apply_heavy_markdown(
     """
     Stage 3 (Auto-Apply): 重量モデルが出力した Markdown から
     '### FILE: ~/path/to/file' セクションを分割して自動保存する。
-    - セクション冒頭が ``` で始まる場合は最初の ``` と最後の ``` の間を抽出。
-    - 冒頭が ``` で始まらない場合（Markdown設計書等）は内部のコード例で途切れないようセクション全文を保存。
-    - '### FILE:' が省略された場合でも target_files が1件のみならそのファイルへフォールバック保存。
+    コードブロックの未クローズ（途中切断）および同名ファイルの重複存在を自動検知して警告を付与する。
     """
     ws = get_workspace_dir().resolve()
     applied_reports: list[str] = []
 
-    def _extract_body(section_text: str) -> str:
+    def _extract_body(section_text: str) -> tuple[str, bool]:
         stripped = section_text.strip()
         first_fence = re.match(r"^```[^\n]*\n", stripped)
         if first_fence:
             content_start = first_fence.end()
             last_fence_pos = stripped.rfind("```")
             if last_fence_pos > first_fence.start():
-                return stripped[content_start:last_fence_pos]
-            return stripped[content_start:]
-        return stripped + "\n"
+                body = stripped[content_start:last_fence_pos]
+                is_truncated = False
+            else:
+                body = stripped[content_start:]
+                is_truncated = True
+            return body, is_truncated
+        return stripped + "\n", False
 
-    def _save_to_path(raw_path: str, body: str) -> None:
+    def _save_to_path(raw_path: str, body: str, is_truncated: bool) -> None:
         target = resolve_workspace_path(raw_path)
         if not target or target.is_dir():
             applied_reports.append(f"[ERROR] Invalid target path skipped: {raw_path}")
@@ -657,7 +679,10 @@ def auto_apply_heavy_markdown(
         target.write_text(body, encoding="utf-8")
         rel = target.relative_to(ws)
         line_cnt = len(body.splitlines())
-        applied_reports.append(f"~/{rel} ({line_cnt} lines, {len(body)} chars)")
+        report = f"~/{rel} ({line_cnt} lines, {len(body)} chars)"
+        if is_truncated:
+            report += " [WARNING: TRUNCATED_OUTPUT - 出力が途中で切れています。invoke_heavy_brainを再実行せず edit_lines で末尾を補完してください]"
+        applied_reports.append(report)
 
     matches = list(HEAVY_FILE_HEADER_PATTERN.finditer(markdown_text))
     if matches:
@@ -666,13 +691,20 @@ def auto_apply_heavy_markdown(
             section_start = match.end()
             section_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(markdown_text)
             section = markdown_text[section_start:section_end]
-            code_body = _extract_body(section)
+            code_body, is_truncated = _extract_body(section)
             if code_body.strip():
-                _save_to_path(raw_path, code_body)
+                _save_to_path(raw_path, code_body, is_truncated)
     elif default_targets and len(default_targets) == 1 and markdown_text.strip():
         raw_path = str(default_targets[0]).strip().strip("`'\"* ")
-        code_body = _extract_body(markdown_text)
+        code_body, is_truncated = _extract_body(markdown_text)
         if code_body.strip():
-            _save_to_path(raw_path, code_body)
+            _save_to_path(raw_path, code_body, is_truncated)
+
+    duplicates = _find_duplicate_workspace_files(ws)
+    for fname, paths in sorted(duplicates.items()):
+        applied_reports.append(
+            f"[WARNING: DUPLICATE_FILENAME] '{fname}' が複数箇所に存在します ({', '.join(paths)})。"
+            "C/C++の #include 優先順位バグの原因となるため、不要な旧ファイルを run_command('rm ...') で削除してください。"
+        )
 
     return applied_reports

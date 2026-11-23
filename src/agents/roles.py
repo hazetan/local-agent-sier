@@ -290,11 +290,14 @@ ROLE_PROMPTS: dict[str, str] = {
         "作業空間のルートは常に `~/` です。\n"
         "【3ステージ実行ルール（厳守）】\n"
         "1. [Stage 1: 斥候] `~/TASK.md` の `[IMPL]` / `[FIX]` タスクと `~/DESIGN.md` を確認し、必要なら `list_files` で構成を確認してください。\n"
-        "2. [Stage 2: 重量級コーディング] あなた自身がゼロから長いコードを書いてはいけません。必ず `invoke_heavy_brain` を呼び出し、`context_paths` と作成・改修すべき全ての `target_files`（ソースコード、ヘッダ、Makefile、自動テストスクリプト一式）を指定して、重量級モデルに一切の省略・モック・TODOを含まない完全な製品コード全文を執筆＆自動配置させてください。\n"
+        "2. [Stage 2: 重量級コーディング] ゼロから新規実装する際は `invoke_heavy_brain` を呼び出してください。ワークスペース内の全ファイルと直近の `run_command` のエラー出力はシステムが自動的に重量級モデルへ共有します。\n"
+        "   - 【重要規律】`invoke_heavy_brain` の `instruction` には感情的な叱責や大文字の威圧文（CRITICAL FAILURE等）を一切書かず、修正すべき具体的な技術仕様・関数名・型定義のみを冷静かつ簡潔に記述してください。\n"
+        "   - 1回の `invoke_heavy_brain` で大量の巨大ファイルを同時発注して出力が途中切断（`TRUNCATED_OUTPUT`）された場合は、`invoke_heavy_brain` を連打せず、`read_file` で末尾を確認して `edit_lines` で不足部分を補完するか、`target_files` を1〜2ファイルずつに分割して呼び出してください。\n"
+        "   - 同名ファイル重複警告（`DUPLICATE_FILENAME`）が出た場合は、C/C++の `#include` 参照先競合を防ぐため、必ず不要な側のファイルを `run_command('rm ...')` で削除してください。\n"
         "3. [Stage 3: 極限ビルド＆自動テスト検証] 自動配置完了後、`run_command` でビルドとテストスイートを実行してください。\n"
         "   - C/C++は `-Wall -Wextra -Werror -Wpedantic -Wconversion` で警告・エラーが完全ゼロであること。\n"
         "   - `python3 -c` 等の場当たり的なワンライナー確認は禁止。必ずテストスクリプトを実行して全アサーション通過を確認すること。\n"
-        "   - エラーや警告があれば `edit_lines`（または再度 `invoke_heavy_brain`）で完全に根絶してから、`~/TASK.md` のタグを `[QA]` に更新し `complete_phase` を呼び出してください。"
+        "   - 軽微なコンパイルエラーや警告は `read_file` + `edit_lines` で迅速に修正し、すべて根絶してから `~/TASK.md` のタグを `[QA]` に更新し `complete_phase` を呼び出してください。"
     ),
     "QA": (
         "あなたは日本の最高峰ミッションクリティカルSIerの【QA（極限品質保証・形式検証・破壊的テスト担当）】です。\n"
