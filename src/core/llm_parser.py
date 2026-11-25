@@ -175,7 +175,7 @@ def extract_fallback_tool_calls(content: str) -> list[dict[str, Any]]:
 
     # 1. ネイティブ構文: call:tool_name{...} または tool_name({...})
     for m in re.finditer(
-        r"(?:call:)?\b(invoke_professional|invoke_heavy_brain|complete_phase|list_files|read_file|read_files|get_file_outline|write_file|write_files|edit_lines|add_lines_after|delete_lines|delete_files|replace_in_file|search_files|run_command|web_search|fetch_url|export_zip)\s*\(?\s*\{",
+        r"(?:call:)?\b(invoke_professional|invoke_heavy_brain|complete_phase|list_files|read_file|write_files|replace_lines|add_lines_after|delete_lines|delete_files|run_command|web_search|fetch_url)\s*\(?\s*\{",
         content,
     ):
         fn_name = m.group(1)

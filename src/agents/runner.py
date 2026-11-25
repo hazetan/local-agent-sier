@@ -69,7 +69,7 @@ async def run_role_phase(
     instruction: str,
     max_steps: int | None = None,
     require_heavy: bool | None = None,
-) -> tuple[str, list[str]]:
+) -> str:
     """
     各ロール (PM, SE, PG, QA, AUDITOR) のメインループ。
     コンテキスト消費制限や履歴削除を一切行わず、全文・全履歴を保持して推論する。
@@ -96,7 +96,6 @@ async def run_role_phase(
         {"role": "user", "content": instruction},
     ]
 
-    created_zips: list[str] = []
     final_summary = ""
     header_logged = False
     no_tool_streak = 0
@@ -139,7 +138,7 @@ async def run_role_phase(
                     "role": "user",
                     "content": (
                         "ツールが呼び出されませんでした。"
-                        "今すぐ自分でツール（`read_files`, `get_file_outline`, `edit_lines`, `add_lines_after`, `delete_lines`, `write_file`, `run_command` 等）を呼び出すか、"
+                        "今すぐ自分でツール（`read_file`, `replace_lines`, `add_lines_after`, `delete_lines`, `write_files`, `run_command` 等）を呼び出すか、"
                         "難題であれば `invoke_professional` で子タスクを外注するか、完了していれば `complete_phase` を呼び出してください。"
                     ),
                 })
@@ -169,9 +168,6 @@ async def run_role_phase(
 
                 telemetry.add_branch_event(role, fn_name, parsed_args, output)
 
-                if output.startswith("ZIP_CREATED:"):
-                    created_zips.append(output.split("ZIP_CREATED:", 1)[1].strip())
-
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call.get("id", f"call_{step}"),
@@ -191,7 +187,7 @@ async def run_role_phase(
             "RUNNER",
             f"■ End role={role} (steps={actual_steps}, pro_outsourced={pro_invoked_count}, summary_len={len(final_summary)})",
         )
-        return final_summary, created_zips
+        return final_summary
     finally:
         telemetry.end_role(role)
 
@@ -232,7 +228,7 @@ async def _execute_professional_subtask(
     if env_hint:
         pro_sys_prompt += f"\n\n{env_hint}"
 
-    bundle_text = await asyncio.to_thread(build_heavy_context_bundle, ["~/", *raw_targets])
+    bundle_text = await asyncio.to_thread(build_heavy_context_bundle, raw_targets)
     snapshot = build_fresh_workspace_snapshot()
     recent_cmd_logs = _extract_recent_command_logs(parent_messages or [])
     targets_line = f"\n【主な対象ファイル】: {', '.join(raw_targets)}" if raw_targets else ""
@@ -242,7 +238,7 @@ async def _execute_professional_subtask(
         f"{pro_instruction}\n\n"
         f"=== 直近のビルド・テスト・コマンド実行結果 ===\n{recent_cmd_logs}\n\n"
         f"=== ワークスペース初期スナップショット ===\n{bundle_text}\n\n"
-        "上記の状況を踏まえ、ツール（`get_file_outline`, `edit_lines`, `add_lines_after`, `delete_lines`, `delete_files`, `write_file`, `write_files`, `run_command` 等）を直接呼び出して作業を開始し、"
+        "上記の状況を踏まえ、ツール（`read_file`, `replace_lines`, `add_lines_after`, `delete_lines`, `delete_files`, `write_files`, `run_command` 等）を直接呼び出して作業を開始し、"
         "ビルドやテストの通過を確認したら `complete_phase` で完了報告を行ってください。"
     )
 
@@ -311,7 +307,7 @@ async def _execute_professional_subtask(
                     pro_messages.append({
                         "role": "user",
                         "content": (
-                            "ツールが呼び出されませんでした。本文で説明せず、直ちに `edit_lines`, `add_lines_after`, `delete_lines`, `write_file`, `run_command` 等のツールを呼び出すか、"
+                            "ツールが呼び出されませんでした。本文で説明せず、直ちに `replace_lines`, `add_lines_after`, `delete_lines`, `write_files`, `run_command` 等のツールを呼び出すか、"
                             "子タスクが完了していれば `complete_phase` を呼び出してください。"
                         ),
                     })

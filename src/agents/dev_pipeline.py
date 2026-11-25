@@ -54,7 +54,7 @@ async def _execute_single_role(role: str, on_phase_complete: StatusCallback | No
         f"{role} としての職務を遂行し、`~/TASK.md` のステータスを更新してから `complete_phase` を呼んでください。"
     )
     try:
-        summary, _ = await run_role_phase(role, instruction)
+        summary = await run_role_phase(role, instruction)
     except (RuntimeError, aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
         err_detail = f"{type(exc).__name__}: {exc}"
         print(f"[DevPipeline Error ({role})] {err_detail}")
@@ -76,7 +76,7 @@ async def _execute_autonomous_initiative(on_phase_complete: StatusCallback | Non
     """未処理タスクがないアイドル時に、軽量モデルでファイル整理整頓と新規[TODO]タスクの自律起票を行う"""
     system_logger.log("DEV_PIPELINE", "Autonomous initiative worker started (role=SE).")
     try:
-        summary, _ = await run_role_phase(
+        summary = await run_role_phase(
             "SE",
             AUTONOMOUS_INITIATIVE_PROMPT,
             max_steps=get_autonomous_max_steps(),

@@ -4,10 +4,7 @@ from typing import Any
 
 from ddgs import DDGS
 
-from .container import (
-    export_workspace_zip,
-    run_in_sandbox,
-)
+from .container import run_in_sandbox
 
 
 def _tool_run_command(args: dict[str, Any]) -> str:
@@ -47,9 +44,3 @@ def _tool_fetch_url(args: dict[str, Any]) -> str:
         return " ".join(re.sub(r"<[^>]+>", " ", text).split())
     except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
         return f"Fetch error: {exc}"
-
-
-def _tool_export_zip(args: dict[str, Any]) -> str:
-    sub = str(args.get("directory", "~/"))
-    zip_path = export_workspace_zip(sub)
-    return f"ZIP_CREATED:{zip_path}"

@@ -1,11 +1,13 @@
 from typing import Any
 
+from core.config import get_web_search_enable
+
 TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "list_files": {
         "type": "function",
         "function": {
             "name": "list_files",
-            "description": "List files and directories inside ~/ (e.g. '~/', '~/a'). Ignores build/.git/node_modules.",
+            "description": "List files and directories inside ~/ (e.g. '~/', '~/projects'). Ignores build/.git/node_modules.",
             "parameters": {
                 "type": "object",
                 "properties": {"directory": {"type": "string", "description": "Target directory path starting with ~/"}},
@@ -28,102 +30,22 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             },
         },
     },
-    "read_files": {
-        "type": "function",
-        "function": {
-            "name": "read_files",
-            "description": (
-                "Batch-read multiple files at once with '=== FILE: ... ===' headers and 1-based line numbers on the left. "
-                "Automatically skips build/.git/node_modules/binaries. Use this to inspect an entire project or multiple files in 1 step."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "paths": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "List of file or directory paths to read (e.g. ['~/a/main.py', '~/a/utils.py']).",
-                    },
-                    "directory": {
-                        "type": "string",
-                        "description": "Directory to recursively read all text files from (e.g. '~/a').",
-                    },
-                    "extensions": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Optional file extensions filter (e.g. ['.py', '.md']).",
-                    },
-                },
-            },
-        },
-    },
-    "get_file_outline": {
-        "type": "function",
-        "function": {
-            "name": "get_file_outline",
-            "description": (
-                "Extract structural outline (namespaces, classes, structs, functions, methods, and main blocks) "
-                "with 1-based line numbers and brace balance check for one or multiple source files (C/C++/Python/Rust/JS/TS)."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Single file path (e.g. '~/projects/app/test_all.cpp')"},
-                    "paths": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Optional list of file paths to inspect at once",
-                    },
-                },
-            },
-        },
-    },
-    "search_files": {
-        "type": "function",
-        "function": {
-            "name": "search_files",
-            "description": "Search for a keyword or regex across all text files in ~/ (with 1-based line numbers).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Keyword or regex pattern"},
-                    "directory": {"type": "string", "description": "Target directory (default '~/')"},
-                    "extensions": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    "write_file": {
-        "type": "function",
-        "function": {
-            "name": "write_file",
-            "description": "Create or overwrite a single file inside ~/.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "File path starting with ~/"},
-                    "content": {"type": "string"},
-                },
-                "required": ["path", "content"],
-            },
-        },
-    },
     "write_files": {
         "type": "function",
         "function": {
             "name": "write_files",
-            "description": "Batch-create or overwrite multiple files in a single tool call.",
+            "description": "Create or overwrite one or multiple files in a single tool call.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "files": {
                         "type": "array",
+                        "description": "List of files to create or overwrite.",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "path": {"type": "string"},
-                                "content": {"type": "string"},
+                                "path": {"type": "string", "description": "File path starting with ~/"},
+                                "content": {"type": "string", "description": "Full text content of the file"},
                             },
                             "required": ["path", "content"],
                         },
@@ -133,34 +55,35 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             },
         },
     },
-    "edit_lines": {
+    "replace_lines": {
         "type": "function",
         "function": {
-            "name": "edit_lines",
+            "name": "replace_lines",
             "description": (
-                "Replace lines from 'start_line' to 'end_line' (1-based, inclusive, as shown by read_file/read_files) "
-                "with 'new_text'. Supports batch editing multiple ranges across one or multiple files in a single call. "
-                "Multiple edits in the same file are automatically applied bottom-up to prevent line number shifts."
+                "Delete lines from 'start_line' to 'end_line' (1-based, inclusive, as shown by read_file) "
+                "and insert 'new_text' (can be any number of lines) in their place. "
+                "For example, to replace lines 22..24 with 8 new lines of code, set start_line=22, end_line=24, and new_text=<8 lines>. "
+                "Supports batch replacements across one or multiple files in a single call (applied bottom-up automatically)."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "edits": {
+                    "replacements": {
                         "type": "array",
-                        "description": "List of line-range edits to apply in batch.",
+                        "description": "List of line-range replacements to apply in batch.",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "path": {"type": "string", "description": "Target file path (e.g. '~/a/main.py')"},
-                                "start_line": {"type": "integer", "description": "1-based start line number (inclusive)"},
-                                "end_line": {"type": "integer", "description": "1-based end line number (inclusive)"},
-                                "new_text": {"type": "string", "description": "Multi-line replacement string (use '' to delete lines)"},
+                                "path": {"type": "string", "description": "Target file path (e.g. '~/projects/app/main.cpp')"},
+                                "start_line": {"type": "integer", "description": "1-based start line number to replace (inclusive)"},
+                                "end_line": {"type": "integer", "description": "1-based end line number to replace (inclusive)"},
+                                "new_text": {"type": "string", "description": "Multi-line replacement string to insert in place of start_line..end_line"},
                             },
                             "required": ["path", "start_line", "end_line", "new_text"],
                         },
                     },
                 },
-                "required": ["edits"],
+                "required": ["replacements"],
             },
         },
     },
@@ -182,7 +105,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "path": {"type": "string", "description": "Target file path (e.g. '~/a/main.py')"},
+                                "path": {"type": "string", "description": "Target file path (e.g. '~/projects/app/main.cpp')"},
                                 "after_line": {
                                     "type": "integer",
                                     "description": "Line number after which to insert (0 for top of file, or 1-based line number)",
@@ -215,7 +138,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "path": {"type": "string", "description": "Target file path (e.g. '~/a/main.py')"},
+                                "path": {"type": "string", "description": "Target file path (e.g. '~/projects/app/main.cpp')"},
                                 "start_line": {"type": "integer", "description": "1-based start line number to delete (inclusive)"},
                                 "end_line": {"type": "integer", "description": "1-based end line number to delete (inclusive)"},
                             },
@@ -242,22 +165,6 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                     },
                 },
                 "required": ["paths"],
-            },
-        },
-    },
-    "replace_in_file": {
-        "type": "function",
-        "function": {
-            "name": "replace_in_file",
-            "description": "Replace an exact snippet in an existing file inside ~/. Prefer 'edit_lines' for faster and safer partial edits.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "old_text": {"type": "string"},
-                    "new_text": {"type": "string"},
-                },
-                "required": ["path", "old_text", "new_text"],
             },
         },
     },
@@ -294,17 +201,6 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "type": "object",
                 "properties": {"url": {"type": "string"}},
                 "required": ["url"],
-            },
-        },
-    },
-    "export_zip": {
-        "type": "function",
-        "function": {
-            "name": "export_zip",
-            "description": "Package ~/ or a subdirectory into a ZIP archive in the exports folder.",
-            "parameters": {
-                "type": "object",
-                "properties": {"directory": {"type": "string", "description": "Directory to zip, default '~/'"}},
             },
         },
     },
@@ -353,41 +249,46 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     },
 }
 
+WEB_TOOLS = {"web_search", "fetch_url"}
 
 ROLE_ALLOWED_TOOLS: dict[str, list[str]] = {
     "PM": [
-        "list_files", "read_file", "read_files", "get_file_outline", "search_files",
-        "write_file", "write_files", "edit_lines", "add_lines_after", "delete_lines", "delete_files", "replace_in_file",
-        "export_zip", "complete_phase",
+        "list_files", "read_file",
+        "write_files", "replace_lines", "add_lines_after", "delete_lines", "delete_files",
+        "complete_phase",
     ],
     "SE": [
-        "list_files", "read_file", "read_files", "get_file_outline", "search_files",
-        "write_file", "write_files", "edit_lines", "add_lines_after", "delete_lines", "delete_files", "replace_in_file",
+        "list_files", "read_file",
+        "write_files", "replace_lines", "add_lines_after", "delete_lines", "delete_files",
         "invoke_professional", "run_command", "web_search", "fetch_url", "complete_phase",
     ],
     "PG": [
-        "list_files", "read_file", "read_files", "get_file_outline", "search_files",
-        "write_file", "write_files", "edit_lines", "add_lines_after", "delete_lines", "delete_files", "replace_in_file",
+        "list_files", "read_file",
+        "write_files", "replace_lines", "add_lines_after", "delete_lines", "delete_files",
         "invoke_professional", "run_command", "web_search", "fetch_url", "complete_phase",
     ],
     "QA": [
-        "list_files", "read_file", "read_files", "get_file_outline", "search_files",
-        "write_file", "write_files", "edit_lines", "add_lines_after", "delete_lines", "delete_files", "replace_in_file",
+        "list_files", "read_file",
+        "write_files", "replace_lines", "add_lines_after", "delete_lines", "delete_files",
         "run_command", "complete_phase",
     ],
     "AUDITOR": [
-        "read_file", "read_files", "get_file_outline",
-        "write_file", "edit_lines", "add_lines_after", "delete_lines", "complete_phase",
+        "list_files", "read_file",
+        "write_files", "replace_lines", "add_lines_after", "delete_lines", "complete_phase",
     ],
 }
 
-
 PROFESSIONAL_ALLOWED_TOOLS: list[str] = [
-    "list_files", "read_file", "read_files", "get_file_outline", "search_files",
-    "write_file", "write_files", "edit_lines", "add_lines_after", "delete_lines", "delete_files", "replace_in_file",
+    "list_files", "read_file",
+    "write_files", "replace_lines", "add_lines_after", "delete_lines", "delete_files",
     "run_command", "web_search", "fetch_url", "complete_phase",
 ]
 
 
 def get_tools_for_role(tool_names: list[str]) -> list[dict[str, Any]]:
-    return [TOOL_SCHEMAS[name] for name in tool_names if name in TOOL_SCHEMAS]
+    web_enabled = get_web_search_enable()
+    return [
+        TOOL_SCHEMAS[name]
+        for name in tool_names
+        if name in TOOL_SCHEMAS and (web_enabled or name not in WEB_TOOLS)
+    ]

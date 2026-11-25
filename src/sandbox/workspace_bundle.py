@@ -5,7 +5,7 @@ from pathlib import Path
 from core.config import get_workspace_dir
 
 from .container import resolve_workspace_path
-from .file_ops import _collect_workspace_files, _tool_list_files
+from .file_ops import _tool_list_files, _tool_read_file
 
 INITIAL_DOCUMENTS: dict[str, str] = {
     "README.md": (
@@ -41,7 +41,7 @@ INITIAL_DOCUMENTS: dict[str, str] = {
         "- **インターフェースの厳密性**: すべてのモジュール間API、バイナリ構造体（エンディアン・アライメント・パディング明示）、物理単位（SI単位系）、エラーコードを省略なく定義すること。\n"
         "- **自己検証アーキテクチャ**: すべての実装モジュールに対応する単体テスト・結合テスト・カオス/ファジング検証ハーネスの設計を同時に定義すること。\n\n"
         "## 2. 詳細設計仕様\n"
-        "- (SE部門は `invoke_heavy_brain` を用いて、ここに妥協なき完全なアーキテクチャ設計・数理モデル・ディレクトリ構造・API仕様を記述すること)\n"
+        "- (SE部門はここに妥協なき完全なアーキテクチャ設計・数理モデル・ディレクトリ構造・API仕様を記述すること)\n"
     ),
     "REPORT.md": (
         "# PMO Internal Audit & Formal Verification Report (~/REPORT.md)\n\n"
@@ -53,7 +53,6 @@ INITIAL_DOCUMENTS: dict[str, str] = {
         "- ワークスペースは初期状態（クリーン）です。\n"
     ),
 }
-
 
 HEAVY_FILE_HEADER_PATTERN = re.compile(
     r"(?:^|\n)[ \t]*(?:#+|\*\*|-)?[ \t]*FILE[ \t]*:[ \t]*([^\n]+)",
@@ -89,47 +88,26 @@ def read_workspace_doc(name: str) -> str:
     return ""
 
 
-def _find_duplicate_workspace_files(ws: Path) -> dict[str, list[str]]:
-    """ワークスペース内で同一ファイル名が複数パスに存在する重複ファイル群を検出する"""
-    by_name: dict[str, list[str]] = {}
-    for fpath in _collect_workspace_files(["~/"]):
-        rel = f"~/{fpath.relative_to(ws)}"
-        by_name.setdefault(fpath.name, []).append(rel)
-    return {name: paths for name, paths in by_name.items() if len(paths) > 1}
-
-
-def build_heavy_context_bundle(context_paths: list[str] | None = None) -> str:
+def build_heavy_context_bundle(target_files: list[str] | None = None) -> str:
     """
-    Stage 2 用に、参照制限を一切設けずワークスペース (~/) 全体のディレクトリツリー、
-    同名重複ファイルの警告、および全テキストファイルの全文を一括バンドルする。
+    Professional 用に、ワークスペース (~/) 全体のディレクトリツリーと、
+    明示的に指定された target_files のみを行番号付きでバンドルする（無差別なゴミファイル混入を防止）。
     """
     ws = get_workspace_dir().resolve()
     standard_root_docs = {(ws / name).resolve() for name in INITIAL_DOCUMENTS}
-    extra_paths = list(context_paths or [])
-    all_search_paths = list(dict.fromkeys(["~/", *extra_paths]))
-
     tree_listing = _tool_list_files({"directory": "~/"})
-    duplicates = _find_duplicate_workspace_files(ws)
-    dup_lines: list[str] = []
-    if duplicates:
-        dup_lines.append("⚠️ [CRITICAL WARNING: DUPLICATE FILENAMES DETECTED IN WORKSPACE]")
-        for fname, paths in sorted(duplicates.items()):
-            dup_lines.append(f"  - '{fname}' exists in multiple locations: {', '.join(paths)}")
-
-    collected = _collect_workspace_files(all_search_paths, skip_files=standard_root_docs)
     sections: list[str] = [f"=== WORKSPACE FULL DIRECTORY TREE ===\n{tree_listing}"]
-    if dup_lines:
-        sections.append("\n".join(dup_lines))
 
-    if not collected:
-        sections.append("(ワークスペース内に追加のソースファイルはまだ存在しません)")
-        return "\n\n".join(sections)
-
-    for fpath in collected:
-        rel = fpath.relative_to(ws)
-        text = fpath.read_text(encoding="utf-8", errors="replace")
-        line_cnt = len(text.splitlines())
-        sections.append(f"=== FILE: ~/{rel} ({line_cnt} lines, {len(text)} chars) ===\n{text}")
+    seen: set[Path] = set(standard_root_docs)
+    for rp in target_files or []:
+        target = resolve_workspace_path(str(rp))
+        if not target or not target.exists() or target.is_dir():
+            continue
+        resolved = target.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        sections.append(_tool_read_file({"path": str(rp)}))
 
     return "\n\n".join(sections)
 
@@ -139,9 +117,7 @@ def auto_apply_heavy_markdown(
     default_targets: list[str] | None = None,
 ) -> list[str]:
     """
-    Stage 3 (Auto-Apply): 重量モデルが出力した Markdown から
-    '### FILE: ~/path/to/file' セクションを分割して自動保存する。
-    コードブロックの未クローズ（途中切断）および同名ファイルの重複存在を自動検知して警告を付与する。
+    重量モデルが Markdown で '### FILE: ~/path/to/file' セクションを出力した場合に自動保存する。
     """
     ws = get_workspace_dir().resolve()
     applied_reports: list[str] = []
@@ -172,7 +148,7 @@ def auto_apply_heavy_markdown(
         line_cnt = len(body.splitlines())
         report = f"~/{rel} ({line_cnt} lines, {len(body)} chars)"
         if is_truncated:
-            report += " [WARNING: TRUNCATED_OUTPUT - 出力が途中で切れています。invoke_heavy_brainを再実行せず edit_lines で末尾を補完してください]"
+            report += " [WARNING: TRUNCATED_OUTPUT - 出力が途中で切れています。replace_lines で末尾を補完してください]"
         applied_reports.append(report)
 
     matches = list(HEAVY_FILE_HEADER_PATTERN.finditer(markdown_text))
@@ -190,12 +166,5 @@ def auto_apply_heavy_markdown(
         code_body, is_truncated = _extract_body(markdown_text)
         if code_body.strip():
             _save_to_path(raw_path, code_body, is_truncated)
-
-    duplicates = _find_duplicate_workspace_files(ws)
-    for fname, paths in sorted(duplicates.items()):
-        applied_reports.append(
-            f"[WARNING: DUPLICATE_FILENAME] '{fname}' が複数箇所に存在します ({', '.join(paths)})。"
-            "C/C++の #include 優先順位バグの原因となるため、不要な旧ファイルを run_command('rm ...') で削除してください。"
-        )
 
     return applied_reports

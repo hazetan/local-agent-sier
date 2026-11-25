@@ -335,7 +335,7 @@ def get_sandbox_env_hint() -> str | None:
     return get_env_str("SANDBOX_ENV_HINT")
 
 
-# --- Concurrency & Streaming Granularity ---
+# --- Concurrency, Streaming Granularity & Feature Toggles ---
 def get_ollama_num_parallel() -> int | None:
     val = get_env_int("OLLAMA_NUM_PARALLEL")
     return max(1, val) if val is not None else None
@@ -351,3 +351,7 @@ def get_io_chunk_bytes() -> int:
 
 def get_reset_workspace_on_startup() -> bool:
     return bool(get_env_bool("RESET_WORKSPACE_ON_STARTUP"))
+
+
+def get_web_search_enable() -> bool:
+    return require_env_bool("WEB_SEARCH_ENABLE")

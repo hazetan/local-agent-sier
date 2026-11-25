@@ -212,10 +212,6 @@ async def on_message(message: discord.Message) -> None:
         f"{clean_text[:80]!r}",
     )
     async with message.channel.typing():
-        reply_text, zip_files = await handle_client_message(clean_text)
+        reply_text = await handle_client_message(clean_text)
         await send_chunked(message.channel, reply_text, reply_to=message)
-
-        for zp in zip_files:
-            if zp.stat().st_size < 25 * 1024 * 1024:
-                await message.channel.send(file=discord.File(str(zp)))
     system_logger.log("DISCORD_BOT", f"Finished replying to client message in ch={ch_id}.")
