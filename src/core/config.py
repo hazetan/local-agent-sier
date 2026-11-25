@@ -335,7 +335,7 @@ def get_sandbox_env_hint() -> str | None:
     return get_env_str("SANDBOX_ENV_HINT")
 
 
-# --- Concurrency, Streaming Granularity & Context Budget ---
+# --- Concurrency & Streaming Granularity ---
 def get_ollama_num_parallel() -> int | None:
     val = get_env_int("OLLAMA_NUM_PARALLEL")
     return max(1, val) if val is not None else None
@@ -347,10 +347,6 @@ def get_stream_granularity_tokens() -> int:
 
 def get_io_chunk_bytes() -> int:
     return max(4096, require_env_int("IO_CHUNK_BYTES"))
-
-
-def get_max_ctx_chars_budget(is_heavy: bool = False) -> int:
-    return require_env_int("CTX_CHAR_BUDGET_HEAVY" if is_heavy else "CTX_CHAR_BUDGET_LIGHT")
 
 
 def get_reset_workspace_on_startup() -> bool:

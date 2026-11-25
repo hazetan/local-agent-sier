@@ -8,8 +8,9 @@ from core.config import (
     get_status_channel_id,
     get_status_update_interval_sec,
 )
+from core.dashboard_render import render_raw_log_box, render_status_box
 from core.logger import system_logger
-from core.telemetry import render_raw_log_box, render_status_box, telemetry
+from core.telemetry import telemetry
 
 STATUS_MIN_INTERVAL_SEC = 6.5
 RAW_LOG_MIN_INTERVAL_SEC = 6.5

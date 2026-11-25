@@ -1,15 +1,7 @@
 import base64
 import html
-import mimetypes
-import os
-import shlex
-import shutil
-import socket
-import subprocess
 import urllib.parse
-import xml.etree.ElementTree as ET
-from datetime import UTC, datetime
-from email.utils import format_datetime
+from datetime import datetime
 from pathlib import Path
 
 from aiohttp import web
@@ -25,105 +17,17 @@ from .config import (
     get_nas_password,
     get_nas_port,
     get_nas_user,
-    get_samba_enable,
-    get_samba_port,
     get_workspace_dir,
 )
+from .nas_samba import (
+    ensure_samba_service,
+    get_local_ip,
+    get_nas_status_summary,
+    stop_samba_service,
+)
+from .nas_webdav import handle_webdav
 
-SAMBA_CONTAINER_NAME = "sier_workspace_samba"
-
-
-def get_local_ip() -> str:
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))
-            return s.getsockname()[0]
-    except OSError:
-        return "127.0.0.1"
-
-
-def get_nas_status_summary() -> str:
-    if not get_nas_enable():
-        return "NAS: Disabled"
-    ip = get_local_ip()
-    port = get_nas_port()
-    smb = f" | SMB:\\\\{ip}\\workspace" if get_samba_enable() else ""
-    return f"NAS: http://{ip}:{port} (Web/DAV){smb}"
-
-
-def ensure_samba_service() -> None:
-    """SAMBA_ENABLE=True の場合、workspace/ を共有する軽量Sambaコンテナを起動する"""
-    subprocess.run(["docker", "rm", "-f", SAMBA_CONTAINER_NAME], check=False, capture_output=True)
-    if not get_samba_enable():
-        return
-
-    ws_dir = get_workspace_dir().resolve()
-    user = get_nas_user() or "agent"
-    password = get_nas_password()
-    smb_port = get_samba_port()
-
-    if not password:
-        print("[NAS] Warning: NAS_PASSWORD is not set in .env. Skipping Samba startup for security.")
-        return
-
-    subprocess.run(["sudo", "-n", "systemctl", "stop", "smbd", "nmbd"], check=False, capture_output=True)
-
-    uid = os.getuid()
-    gid = os.getgid()
-
-    smb_conf = (
-        "[global]\n"
-        "workgroup = WORKGROUP\n"
-        "server string = SIer Workspace NAS\n"
-        "security = user\n"
-        "map to guest = Never\n"
-        "ntlm auth = yes\n"
-        "server min protocol = SMB2\n"
-        "create mask = 0664\n"
-        "directory mask = 0775\n"
-        f"force user = {user}\n"
-        "force group = nasgroup\n\n"
-        "[workspace]\n"
-        "path = /workspace\n"
-        "browsable = yes\n"
-        "writable = yes\n"
-        "read only = no\n"
-        f"valid users = {user}\n"
-    )
-
-    q_user = shlex.quote(user)
-    q_pass = shlex.quote(password)
-    q_conf = shlex.quote(smb_conf)
-
-    setup_script = (
-        "apk add --no-cache samba >/dev/null && "
-        "mkdir -p /var/lib/samba/private /run/samba && "
-        f"addgroup -g {gid} nasgroup 2>/dev/null || true && "
-        f"adduser -D -H -u {uid} -G nasgroup {q_user} 2>/dev/null || true && "
-        f"printf '%s\\n%s\\n' {q_pass} {q_pass} | smbpasswd -a -s {q_user} && "
-        f"smbpasswd -e {q_user} && "
-        f"printf '%s' {q_conf} > /etc/samba/smb.conf && "
-        "smbd --foreground --no-process-group"
-    )
-
-    cmd = [
-        "docker", "run", "-d",
-        "--name", SAMBA_CONTAINER_NAME,
-        "-p", f"{smb_port}:445",
-        "-v", f"{ws_dir}:/workspace",
-        "alpine:latest",
-        "sh", "-c", setup_script,
-    ]
-    res = subprocess.run(cmd, check=False, capture_output=True, text=True)
-    if res.returncode == 0:
-        print(f"[NAS] Samba server started: \\\\{get_local_ip()}\\workspace (user: {user})")
-    else:
-        subprocess.run(["docker", "rm", "-f", SAMBA_CONTAINER_NAME], check=False, capture_output=True)
-        print(f"[NAS] Failed to start Samba container: {res.stderr.strip()}")
-
-
-def stop_samba_service() -> None:
-    subprocess.run(["docker", "rm", "-f", SAMBA_CONTAINER_NAME], check=False, capture_output=True)
+__all__ = ["WorkspaceNASServer", "get_nas_status_summary", "nas_server"]
 
 
 # --- Basic Auth Middleware (NAS_USER / NAS_PASSWORD が設定されている場合に有効化) ---
@@ -285,113 +189,6 @@ async def handle_api_zip(request: web.Request) -> web.StreamResponse:
     rel_path = request.query.get("path", ".")
     zip_path = export_workspace_zip(rel_path)
     return web.FileResponse(zip_path)
-
-
-# --- WebDAV Handlers (/dav/... : Windows / iOS / Android ネイティブマウント用) ---
-def _dav_prop_response(href: str, path: Path) -> ET.Element:
-    resp = ET.Element("{DAV:}response")
-    ET.SubElement(resp, "{DAV:}href").text = href
-    propstat = ET.SubElement(resp, "{DAV:}propstat")
-    prop = ET.SubElement(propstat, "{DAV:}prop")
-
-    ET.SubElement(prop, "{DAV:}displayname").text = path.name or "workspace"
-    res_type = ET.SubElement(prop, "{DAV:}resourcetype")
-    if path.is_dir():
-        ET.SubElement(res_type, "{DAV:}collection")
-    else:
-        stat = path.stat()
-        ET.SubElement(prop, "{DAV:}getcontentlength").text = str(stat.st_size)
-        mime, _ = mimetypes.guess_type(path.name)
-        ET.SubElement(prop, "{DAV:}getcontenttype").text = mime or "application/octet-stream"
-
-    mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
-    ET.SubElement(prop, "{DAV:}getlastmodified").text = format_datetime(mtime, usegmt=True)
-    ET.SubElement(propstat, "{DAV:}status").text = "HTTP/1.1 200 OK"
-    return resp
-
-
-async def handle_webdav(request: web.Request) -> web.StreamResponse:
-    tail = request.match_info.get("tail", "")
-    target = resolve_workspace_path(tail)
-    if not target:
-        return web.Response(status=403, text="Forbidden")
-
-    method = request.method.upper()
-    if method == "OPTIONS":
-        return web.Response(
-            status=200,
-            headers={
-                "DAV": "1, 2",
-                "Allow": "OPTIONS, GET, HEAD, PUT, DELETE, MKCOL, PROPFIND, MOVE, COPY",
-                "MS-Author-Via": "DAV",
-            },
-        )
-
-    if method == "PROPFIND":
-        if not target.exists():
-            return web.Response(status=404)
-        depth = request.headers.get("Depth", "1")
-        multistatus = ET.Element("{DAV:}multistatus")
-        base_href = "/dav/" + tail.strip("/")
-        if target.is_dir() and not base_href.endswith("/"):
-            base_href += "/"
-        multistatus.append(_dav_prop_response(base_href, target))
-
-        if target.is_dir() and depth != "0":
-            for child in sorted(target.iterdir()):
-                if child.name in IGNORE_DIRS:
-                    continue
-                c_href = base_href + urllib.parse.quote(child.name) + ("/" if child.is_dir() else "")
-                multistatus.append(_dav_prop_response(c_href, child))
-
-        xml_bytes = ET.tostring(multistatus, encoding="utf-8", xml_declaration=True)
-        return web.Response(status=207, body=xml_bytes, content_type="application/xml; charset=utf-8")
-
-    if method in ("GET", "HEAD"):
-        if not target.exists() or target.is_dir():
-            return web.Response(status=404)
-        return web.FileResponse(target)
-
-    if method == "PUT":
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with target.open("wb") as f:
-            async for chunk in request.content.iter_chunked(65536):
-                f.write(chunk)
-        return web.Response(status=201)
-
-    if method == "MKCOL":
-        target.mkdir(parents=True, exist_ok=True)
-        return web.Response(status=201)
-
-    if method == "DELETE":
-        if not target.exists():
-            return web.Response(status=404)
-        if target.is_dir():
-            shutil.rmtree(target)
-        else:
-            target.unlink()
-        return web.Response(status=204)
-
-    if method in ("MOVE", "COPY"):
-        dest_hdr = request.headers.get("Destination", "")
-        parsed = urllib.parse.urlparse(dest_hdr)
-        dest_rel = urllib.parse.unquote(parsed.path)
-        if "/dav/" in dest_rel:
-            dest_rel = dest_rel.split("/dav/", 1)[1]
-        dest_path = resolve_workspace_path(dest_rel)
-        if not dest_path or not target.exists():
-            return web.Response(status=400)
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
-        if method == "MOVE":
-            shutil.move(str(target), str(dest_path))
-        else:
-            if target.is_dir():
-                shutil.copytree(target, dest_path, dirs_exist_ok=True)
-            else:
-                shutil.copy2(target, dest_path)
-        return web.Response(status=201)
-
-    return web.Response(status=405)
 
 
 class WorkspaceNASServer:
