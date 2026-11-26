@@ -4,6 +4,7 @@ exports/
 logs/
 *.log
 *.zip
+!img
 
 # Environment Variables
 .env
