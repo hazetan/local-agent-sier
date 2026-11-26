@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SIer Multi-Agent Command Center</title>
+  <style>
+    :root {
+      --bg-main: #0d1117;
+      --bg-panel: #161b22;
+      --bg-code: #010409;
+      --border: #30363d;
+      --text-main: #c9d1d9;
+      --text-muted: #8b949e;
+      --cyan: #58a6ff;
+      --green: #3fb950;
+      --yellow: #d29922;
+      --red: #f85149;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 14px;
+      background: var(--bg-main);
+      color: var(--text-main);
+      font-family: "JetBrains Mono", "Consolas", "Meiryo", monospace;
+      font-size: 13px;
+    }
+    /* Header */
+    .top-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 10px;
+      background: var(--bg-panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 16px;
+      margin-bottom: 12px;
+    }
+    .brand { font-size: 15px; font-weight: bold; color: var(--green); }
+    .active-badge { color: var(--cyan); font-weight: bold; }
+    .hw-stats { display: flex; gap: 16px; color: var(--yellow); }
+    .btn-link {
+      background: #238636;
+      color: #fff;
+      text-decoration: none;
+      padding: 6px 12px;
+      border-radius: 6px;
+      font-size: 12px;
+    }
+    /* Grid Layout */
+    .grid-container {
+      display: grid;
+      grid-template-columns: 1.15fr 1fr;
+      gap: 12px;
+      height: calc(100vh - 82px);
+    }
+    .col {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      min-height: 0;
+    }
+    .panel {
+      background: var(--bg-panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+    .panel-title {
+      font-weight: bold;
+      color: var(--cyan);
+      margin-bottom: 8px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 6px;
+      display: flex;
+      justify-content: space-between;
+    }
+    /* Roles Table */
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    th, td {
+      padding: 6px 8px;
+      border-bottom: 1px solid #21262d;
+      text-align: left;
+    }
+    th { color: var(--text-muted); }
+    tr.active-role {
+      background: rgba(88, 166, 255, 0.12);
+      color: var(--yellow);
+      font-weight: bold;
+    }
+    /* Tasks List */
+    #sier-tasks-list {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+      overflow-y: auto;
+      max-height: 180px;
+    }
+    #sier-tasks-list li {
+      padding: 5px 8px;
+      border-bottom: 1px solid #21262d;
+    }
+    .task-done { color: var(--green); }
+    .task-todo, .task-impl, .task-qa { color: var(--cyan); }
+    .task-fix { color: var(--red); }
+
+    /* Live Raw Stream */
+    .raw-panel { flex: 1; }
+    .raw-grid {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      flex: 1;
+      min-height: 0;
+    }
+    .raw-section {
+      display: flex;
+      flex-direction: column;
+      flex: 1;
+      min-height: 0;
+    }
+    .raw-section.tool-sec { flex: 0 0 90px; }
+    .raw-label { font-size: 11px; color: var(--text-muted); margin-bottom: 3px; }
+    pre.stream-box {
+      margin: 0;
+      padding: 8px;
+      background: var(--bg-code);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      flex: 1;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    #sier-raw-thought { color: #e6edf3; }
+    #sier-raw-tool { color: var(--cyan); }
+    #sier-raw-output { color: var(--green); }
+
+    /* Chat & Feed Panel */
+    .chat-panel { flex: 1; }
+    #sier-feed-log {
+      flex: 1;
+      overflow-y: auto;
+      background: var(--bg-code);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px;
+      margin-bottom: 10px;
+    }
+    .feed-item {
+      margin-bottom: 12px;
+      padding: 8px 10px;
+      border-radius: 6px;
+      background: #161b22;
+      border-left: 3px solid var(--cyan);
+    }
+    .feed-item.feed-client { border-left-color: var(--yellow); }
+    .feed-item.feed-pm { border-left-color: var(--green); }
+    .feed-meta { font-size: 11px; color: var(--text-muted); margin-bottom: 4px; }
+    pre.feed-body {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: inherit;
+    }
+    /* Chat Form */
+    #sier-chat-form {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    #sier-chat-input {
+      width: 100%;
+      height: 76px;
+      background: var(--bg-code);
+      color: var(--text-main);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px;
+      font-family: inherit;
+      resize: vertical;
+    }
+    .chat-controls {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+    }
+    button[type="submit"] {
+      background: #238636;
+      color: #fff;
+      border: none;
+      padding: 8px 18px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: bold;
+    }
+    button[type="submit"]:hover { background: #2ea043; }
+    @media (max-width: 1024px) {
+      .grid-container { grid-template-columns: 1fr; height: auto; }
+      .raw-panel, .chat-panel { height: 550px; }
+    }
+  </style>
+</head>
+<body>
+  <!-- Top Status Bar -->
+  <header class="top-bar">
+    <div>
+      <span class="brand">● SIer MULTI-AGENT MONITOR</span>
+      <span style="margin-left: 12px;">Active: <span id="sier-active-role" class="active-badge">CONNECTING...</span></span>
+    </div>
+    <div class="hw-stats">
+      <span id="sier-vram-bar">VRAM: -- / -- GB</span>
+      <span id="sier-ram-bar">RAM: -- / -- GB</span>
+    </div>
+    <div>
+      <a class="btn-link" href="/api/sier/workspace/zip" target="_blank">📦 Download Workspace ZIP</a>
+    </div>
+  </header>
+
+  <!-- Main 2-Column Grid -->
+  <main class="grid-container">
+    <!-- Left Column: Roles, Tasks & Realtime Raw Stream -->
+    <section class="col">
+      <div class="panel">
+        <div class="panel-title"><span>[ROLES: MEMORY, SPEED &amp; CONTEXT]</span></div>
+        <table>
+          <thead>
+            <tr>
+              <th>Role</th>
+              <th>Model</th>
+              <th>Memory</th>
+              <th>Speed</th>
+              <th>Context (Tokens)</th>
+            </tr>
+          </thead>
+          <tbody id="sier-roles-tbody"></tbody>
+        </table>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title"><span>[TASK PIPELINE (~/TASK.md)]</span></div>
+        <ul id="sier-tasks-list"></ul>
+      </div>
+
+      <div class="panel raw-panel">
+        <div class="panel-title">
+          <span>⚡ LIVE RAW STREAM (文字数無制限)</span>
+          <span id="sier-raw-header" style="color: var(--yellow); font-weight: normal;">Idle</span>
+        </div>
+        <div class="raw-grid">
+          <div class="raw-section">
+            <span class="raw-label">1. RAW THOUGHT (モデルの思考・ドラフト全文)</span>
+            <pre id="sier-raw-thought" class="stream-box">(待機中...)</pre>
+          </div>
+          <div class="raw-section tool-sec">
+            <span class="raw-label">2. EXECUTED TOOL &amp; ARGUMENTS (実行ツール・引数)</span>
+            <pre id="sier-raw-tool" class="stream-box">-</pre>
+          </div>
+          <div class="raw-section">
+            <span class="raw-label">3. RAW EXECUTION OUTPUT (コマンド・ツール実行結果全文)</span>
+            <pre id="sier-raw-output" class="stream-box">(まだ出力はありません)</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Right Column: PM Chat & Department Completion Feed -->
+    <section class="col">
+      <div class="panel chat-panel">
+        <div class="panel-title"><span>💬 PM DIRECT CHAT &amp; DEPARTMENT REPORTS</span></div>
+        <div id="sier-feed-log"></div>
+        <form id="sier-chat-form">
+          <textarea
+            id="sier-chat-input"
+            placeholder="PM（プロジェクトマネージャー）への要件定義・実装指示を入力してください..."
+          ></textarea>
+          <div class="chat-controls">
+            <input type="file" id="sier-chat-files" multiple />
+            <button type="submit">🚀 PMへ送信</button>
+          </div>
+        </form>
+      </div>
+    </section>
+  </main>
+
+  <script type="module">
+    import { SIerDashboardClient } from "/api/sier/static/sier_dashboard.js";
+    const client = new SIerDashboardClient("/api/sier");
+    client.init();
+  </script>
+</body>
+</html>

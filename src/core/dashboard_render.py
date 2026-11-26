@@ -1,5 +1,6 @@
 import re
 import unicodedata
+from typing import Any
 
 import aiohttp
 
@@ -374,3 +375,124 @@ def render_raw_log_box() -> str:
     ]
 
     return _wrap_ansi_box(lines)
+
+
+async def collect_dashboard_metrics() -> dict[str, Any]:
+    """Web API / WebSocket 向けに文字数制限なしの稼働メトリクス・タスクツリー・生ログ全文を辞書で返す"""
+    ps_map = await _fetch_ollama_memory()
+    hw_data = await _fetch_desktop_hw_metrics()
+
+    max_vram = (hw_data.get("vram_total_gb") if hw_data else None) or get_desktop_vram_gb() or 0.0
+    max_ram = (hw_data.get("ram_total_gb") if hw_data else None) or get_desktop_ram_gb() or 0.0
+    rpi_free = _get_rpi_free_ram_gb()
+
+    if hw_data:
+        used_vram = hw_data.get("vram_used_gb", 0.0)
+        used_ram = hw_data.get("ram_used_gb", 0.0)
+        ollama_real_mem = used_vram + hw_data.get("ollama_ram_gb", 0.0)
+    else:
+        used_vram = sum(v for v, _ in ps_map.values())
+        used_ram = sum(r for _, r in ps_map.values())
+        ollama_real_mem = used_vram + used_ram
+
+    light_ctx = get_server_ctx_size() or 0
+    heavy_ctx = get_heavy_ctx_size() or light_ctx
+    total_sys_mem = max_vram + max_ram
+    total_ps_mem = sum(v + r for v, r in ps_map.values())
+
+    roles_data: list[dict[str, Any]] = []
+    for role in ROLES:
+        is_heavy = role in telemetry.heavy_active_roles
+        try:
+            model = get_heavy_model_for_role(role) if is_heavy else get_model_for_role(role)
+        except RuntimeError:
+            model = "none"
+
+        role_max_ctx = heavy_ctx if is_heavy else light_ctx
+        v_gb, r_gb = ps_map.get(model, (0.0, 0.0))
+        if v_gb == 0.0 and r_gb == 0.0:
+            for loaded_name, mem_pair in ps_map.items():
+                if model.lower() in loaded_name.lower() or loaded_name.lower() in model.lower():
+                    v_gb, r_gb = mem_pair
+                    break
+
+        ps_role_mem = v_gb + r_gb
+        if hw_data and ps_role_mem > 0 and total_ps_mem > 0:
+            role_mem = ollama_real_mem * (ps_role_mem / total_ps_mem)
+        elif hw_data and len(ps_map) == 1 and ps_role_mem > 0:
+            role_mem = ollama_real_mem
+        else:
+            role_mem = ps_role_mem
+
+        ctx_tok = telemetry.role_ctx_tokens.get(role, 0)
+        roles_data.append({
+            "role": role,
+            "model": model,
+            "is_active": role in telemetry.active_roles,
+            "is_heavy": is_heavy,
+            "mem_gb": round(role_mem, 2),
+            "mem_pct": round((role_mem / total_sys_mem) * 100, 1) if total_sys_mem > 0 else 0.0,
+            "tps": round(telemetry.role_tps.get(role, 0.0), 1),
+            "ctx_tokens": ctx_tok,
+            "max_ctx": role_max_ctx,
+            "ctx_pct": round((ctx_tok / role_max_ctx) * 100, 1) if role_max_ctx > 0 else 0.0,
+            "branches": [
+                {"role": b.role, "action": b.action, "result": b.result}
+                for b in telemetry.role_branches.get(role, [])
+            ],
+        })
+
+    tasks = _parse_tasks_from_md()
+    active_task_map: dict[int, str] = {}
+    for act_role in ROLES:
+        if act_role not in telemetry.active_roles:
+            continue
+        target_statuses = ROLE_TARGET_STATUSES.get(act_role, ())
+        for idx, (st, _) in enumerate(tasks):
+            if st in target_statuses and idx not in active_task_map:
+                active_task_map[idx] = act_role
+                break
+
+    tasks_data = [
+        {
+            "index": idx,
+            "status": st,
+            "title": title,
+            "working_role": active_task_map.get(idx),
+        }
+        for idx, (st, title) in enumerate(tasks)
+    ]
+
+    return {
+        "timestamp": now_jst_str(),
+        "active_role_label": telemetry.active_role_label,
+        "hardware": {
+            "vram_used_gb": round(used_vram, 2),
+            "vram_total_gb": round(max_vram, 2),
+            "vram_pct": round((used_vram / max_vram) * 100, 1) if max_vram > 0 else 0.0,
+            "ram_used_gb": round(used_ram, 2),
+            "ram_total_gb": round(max_ram, 2),
+            "ram_pct": round((used_ram / max_ram) * 100, 1) if max_ram > 0 else 0.0,
+            "rpi_free_gb": round(rpi_free, 2),
+        },
+        "roles": roles_data,
+        "tasks": tasks_data,
+        "raw_stream": collect_raw_stream_snapshot(),
+    }
+
+
+def collect_raw_stream_snapshot() -> dict[str, Any]:
+    """文字数切り詰めなしのリアルタイム生思考・ツール入出力スナップショットを返す"""
+    return {
+        "timestamp": now_jst_str(),
+        "role": telemetry.raw_role,
+        "model": telemetry.raw_model,
+        "step": telemetry.raw_step,
+        "max_steps": telemetry.raw_max_steps,
+        "latency": round(telemetry.raw_latency, 1),
+        "tps": round(telemetry.raw_tps, 1),
+        "thought": telemetry.raw_thought,
+        "tool_name": telemetry.raw_tool_name,
+        "tool_args": telemetry.raw_tool_args,
+        "tool_output": telemetry.raw_tool_output,
+    }

@@ -355,3 +355,20 @@ def get_reset_workspace_on_startup() -> bool:
 
 def get_web_search_enable() -> bool:
     return require_env_bool("WEB_SEARCH_ENABLE")
+    
+    
+# --- Deployment Mode (Discord / Web API) Settings ---
+def get_discord_enable() -> bool:
+    return require_env_bool("DISCORD_ENABLE")
+
+
+def get_web_enable() -> bool:
+    return require_env_bool("WEB_ENABLE")
+
+
+def get_web_host() -> str:
+    return require_env("WEB_HOST")
+
+
+def get_web_port() -> int:
+    return require_env_int("WEB_PORT")

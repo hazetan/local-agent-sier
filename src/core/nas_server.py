@@ -197,7 +197,7 @@ class WorkspaceNASServer:
 
     async def start(self) -> None:
         ensure_samba_service()
-        if not get_nas_enable():
+        if not get_nas_enable() or self.runner is not None:
             return
 
         app = web.Application(middlewares=[basic_auth_middleware], client_max_size=512 * 1024 * 1024)
@@ -213,12 +213,11 @@ class WorkspaceNASServer:
         await self.runner.setup()
         port = get_nas_port()
         site = web.TCPSite(self.runner, "0.0.0.0", port)
-        await site.start()
-        print(f"[NAS] WebUI & WebDAV started on http://{get_local_ip()}:{port} (DAV: /dav/)")
-
-    async def stop(self) -> None:
-        stop_samba_service()
-        if self.runner:
+        try:
+            await site.start()
+            print(f"[NAS] WebUI & WebDAV started on http://{get_local_ip()}:{port} (DAV: /dav/)")
+        except OSError as exc:
+            print(f"[NAS] Port {port} is already in use ({exc}). Skipping duplicate NAS server bind.")
             await self.runner.cleanup()
             self.runner = None
 
